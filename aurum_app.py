@@ -2,15 +2,17 @@ import streamlit as st
 import yaml
 import bcrypt
 import os
+import platform
 
 from aurum_core.tab1 import render_tab1
 from aurum_core.tab2 import render_tab2
 from aurum_core.tab3 import render_tab3
 from aurum_core.user_settings import get_user_setting, save_user_settings
 from aurum_core.database import init_database, upgrade_database
+from aurum_core.utils import open_folder
 
 # 当前版本号（每次发布新版本时手动更新）
-CURRENT_VERSION = "1.0.1"  # 请根据实际版本修改
+CURRENT_VERSION = "1.0.2"  # 请根据实际版本修改
 
 # 你的 GitHub 用户名和仓库名
 GITHUB_REPO = "Blue-ringedOctopus/Aurum"  # 替换为你的用户名和仓库名
@@ -33,6 +35,13 @@ def check_for_updates():
     """
     检查 GitHub 最新 Release，如果有更新则显示提示和更新按钮。
     """
+    system = platform.system()
+    if system == 'Darwin':
+        st.info("📢 发现新版本，请前往 GitHub Releases 手动下载并替换 .app 文件。")
+        if st.button("🌐 前往下载页面"):
+            import webbrowser
+            webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
+        return
     api_url = "https://api.github.com/repos/Blue-ringedOctopus/Aurum/releases/latest"  # 替换为你的仓库
     try:
         resp = requests.get(api_url, timeout=10)
@@ -66,12 +75,37 @@ def perform_update(download_url):
     下载新版本的 .zip 压缩包，解压并覆盖旧文件（保留 config.yaml 和 aurum_index.db）。
     """
     try:
-        with st.spinner("正在下载新版本..."):
-            temp_zip = os.path.join(tempfile.gettempdir(), "Aurum_update.zip")
-            response = requests.get(download_url, stream=True)
-            with open(temp_zip, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+        # 代理列表（按速度与稳定性排序）
+        PROXY_LIST = [
+            "https://ghproxy.com/",
+            "https://ghproxy.net/",
+            "https://gitproxy.click/",
+        ]
+        urls_to_try = [download_url] + [proxy + download_url for proxy in PROXY_LIST]
+
+        # 准备临时文件
+        temp_zip = os.path.join(tempfile.gettempdir(), "Aurum_update.zip")
+        downloaded = False
+
+        # 尝试下载
+        for url in urls_to_try:
+            try:
+                response = requests.get(url, stream=True, timeout=30)
+                if response.status_code == 200:
+                    with open(temp_zip, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    downloaded = True
+                    break
+            except:
+                continue
+
+        if not downloaded:
+            st.error("下载失败，请检查网络或前往 GitHub Releases 手动下载。")
+            if st.button("🌐 前往下载"):
+                webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
+            return
+
         st.success("下载完成，正在解压...")
 
         # 解压到临时文件夹
@@ -441,7 +475,7 @@ else:
         st.sidebar.write(f"**数据库文件**：`{db_path}`")
         if st.sidebar.button("📂 打开数据库所在文件夹", key="open_db_folder"):
             try:
-                os.startfile(os.path.dirname(db_path))
+                open_folder(db_path)
             except Exception as e:
                 st.sidebar.error(f"打开失败：{e}")
         st.sidebar.caption("💡 请不要移动数据库文件，以免程序出错。")
