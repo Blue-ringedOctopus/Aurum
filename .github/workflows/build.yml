@@ -15,10 +15,10 @@ jobs:
         include:
           - os: windows-latest
             output_name: Aurum_Windows
-            pyinstaller_args: --onedir --noconsole --icon=Aurum.ico
+            pyinstaller_args: --onedir --noconsole --icon=Aurum.ico --add-data "aurum_core;aurum_core" --add-data "README.txt;." --add-data "aurum_app.py;."
           - os: macos-latest
             output_name: Aurum_macOS
-            pyinstaller_args: --onedir --noconsole --icon=Aurum.icns  # 若没有 .icns 可去掉 --icon
+            pyinstaller_args: --onedir --noconsole --icon=Aurum.icns --add-data "aurum_core:aurum_core" --add-data "README.txt:." --add-data "aurum_app.py:."
 
     steps:
       - name: Checkout code
@@ -41,7 +41,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller ${{ matrix.pyinstaller_args }} --name Aurum --add-data "aurum_core;aurum_core" --add-data "README.txt;." --add-data "aurum_app.py;." --hidden-import streamlit --hidden-import streamlit.web --hidden-import streamlit.web.cli --hidden-import pypinyin --hidden-import docx --hidden-import openai --hidden-import yaml --hidden-import bcrypt --hidden-import pandas --hidden-import requests --hidden-import packaging --collect-all streamlit --collect-all certifi run.py
+          pyinstaller ${{ matrix.pyinstaller_args }} --name Aurum --hidden-import streamlit --hidden-import streamlit.web --hidden-import streamlit.web.cli --hidden-import pypinyin --hidden-import docx --hidden-import openai --hidden-import yaml --hidden-import bcrypt --hidden-import pandas --hidden-import requests --hidden-import packaging --collect-all streamlit --collect-all certifi run.py
 
       - name: Upload Windows artifact
         if: matrix.os == 'windows-latest'
