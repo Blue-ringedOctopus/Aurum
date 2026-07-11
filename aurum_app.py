@@ -66,9 +66,8 @@ def check_for_updates(show_ignore: bool = True):
 
     # macOS 特殊处理
     if platform.system() == 'Darwin':
-        st.info("📢 请前往 GitHub Releases 手动下载最新版本。")
-        if st.button("🌐 前往下载页面"):
-            webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
+        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})")
+        st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
         return
 
     # 禁用 SSL 警告（因为 verify=False）
@@ -92,9 +91,8 @@ def check_for_updates(show_ignore: bool = True):
             return
 
         # 有新版本
-        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})，请手动下载更新。")
-        if st.button("🌐 前往下载", use_container_width=True):
-            webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
+        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})")
+        st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
 
     except requests.exceptions.RequestException as e:
         st.error(f"网络请求失败：{e}\n请检查网络连接后重试，或手动访问 GitHub Releases。")
@@ -158,8 +156,7 @@ def perform_update(download_url):
 
         if not downloaded:
             st.error("下载失败，请检查网络或前往 GitHub Releases 手动下载。")
-            if st.button("🌐 前往下载"):
-                webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
+            st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
             return
 
         st.success("下载完成，正在解压...")
