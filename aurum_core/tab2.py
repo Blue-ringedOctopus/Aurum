@@ -19,6 +19,7 @@ from aurum_core.database import (
     get_all_patient_folders,
     check_existing_diagnosis
 )
+from aurum_core.utils import open_folder
 
 
 def render_tab2():
@@ -566,7 +567,7 @@ def render_tab2():
                     failed = 0
                     for folder in folders:
                         try:
-                            os.startfile(folder)
+                            open_folder(folder)
                             opened += 1
                         except Exception as e:
                             failed += 1

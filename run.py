@@ -9,17 +9,7 @@ import psutil
 STREAMLIT_PORT = 8501
 CHECK_INTERVAL = 3
 
-
-def is_port_in_use(port: int) -> bool:
-    """检查端口是否被占用"""
-    for conn in psutil.net_connections(kind='inet'):
-        if conn.laddr.port == port and conn.status == 'ESTABLISHED':
-            return True
-    return False
-
-
 def is_browser_open(port: int) -> bool:
-    """检查是否有浏览器连接 localhost:port（仅 ESTABLISHED 连接）"""
     try:
         for conn in psutil.net_connections(kind='inet'):
             if conn.laddr.port == port and conn.status == 'ESTABLISHED':
@@ -28,41 +18,38 @@ def is_browser_open(port: int) -> bool:
         pass
     return False
 
-
 def browser_watchdog(stop_event: threading.Event, port: int):
-    """看门狗：监听浏览器连接状态"""
-    time.sleep(5)  # 给用户留出打开浏览器的时间
-
+    time.sleep(8)  # 增加等待时间
+    was_open = False
     while not stop_event.is_set():
-        if not is_browser_open(port):
+        if is_browser_open(port):
+            was_open = True
+        elif was_open:
             print("[INFO] Browser closed, exiting...")
-            os._exit(0)  # 直接退出整个进程
+            os._exit(0)
         time.sleep(CHECK_INTERVAL)
 
-
 def open_browser():
-    """延迟打开浏览器"""
     time.sleep(2)
-    webbrowser.open(f"http://localhost:{STREAMLIT_PORT}")
-
+    url = f"http://localhost:{STREAMLIT_PORT}"
+    try:
+        if not webbrowser.open(url):
+            print(f"[INFO] 浏览器未能自动打开，请手动访问: {url}")
+    except Exception as e:
+        print(f"[WARN] 打开浏览器失败: {e}")
+        print(f"[INFO] 请手动打开浏览器访问: {url}")
 
 if __name__ == "__main__":
-    # 切换到 exe 所在目录（确保路径正确）
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
     print(f"[INFO] Aurum starting on port {STREAMLIT_PORT}")
     print("[INFO] Browser will open automatically")
     print("[INFO] Service auto-exits when browser is closed")
 
-    # 启动浏览器（独立线程）
     threading.Thread(target=open_browser, daemon=True).start()
-
-    # 启动看门狗（独立线程）
     stop_event = threading.Event()
     watchdog = threading.Thread(target=browser_watchdog, args=(stop_event, STREAMLIT_PORT), daemon=True)
     watchdog.start()
 
-    # 用 streamlit 的 CLI 入口直接启动（这是关键）
     sys.argv = [
         "streamlit", "run",
         "aurum_app.py",

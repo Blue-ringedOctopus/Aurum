@@ -376,7 +376,7 @@ def render_tab3():
                 if st.button("📂 打开文件夹", type="primary", use_container_width=True):
                     folder_path = os.path.dirname(file_path)
                     try:
-                        os.startfile(folder_path)
+                        open_folder(folder_path)
                         st.toast(f"✅ 已打开：{folder_path}", icon="📁", duration=5)
                     except Exception as e:
                         st.error(f"打开失败：{e}")

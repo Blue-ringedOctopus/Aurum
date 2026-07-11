@@ -12,7 +12,7 @@ from aurum_core.database import init_database, upgrade_database
 from aurum_core.utils import open_folder
 
 # 当前版本号（每次发布新版本时手动更新）
-CURRENT_VERSION = "1.0.3"  # 请根据实际版本修改
+CURRENT_VERSION = "1.0.0"  # 请根据实际版本修改
 
 # 你的 GitHub 用户名和仓库名
 GITHUB_REPO = "Blue-ringedOctopus/Aurum"  # 替换为你的用户名和仓库名
@@ -31,51 +31,115 @@ if not os.path.exists('config.yaml'):
     with open('config.yaml', 'w', encoding='utf-8') as f:
         yaml.dump(default_config, f, allow_unicode=True, default_flow_style=False)
 
-def check_for_updates():
+def get_cert_path():
+    """返回可用的 CA 证书路径，用于 requests 的 verify 参数"""
+    import os
+    import sys
+
+    # 打包环境：one-dir 模式下，exe 所在目录即为根目录
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.abspath('.')
+
+    # 优先使用打包时一起发布的 cacert.pem
+    cert_path = os.path.join(base, 'cacert.pem')
+    if os.path.exists(cert_path):
+        return cert_path
+
+    # 备选：使用 certifi 库提供的证书（如果环境中存在）
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return None
+
+def check_for_updates(show_ignore: bool = True):
     """
-    检查 GitHub 最新 Release，如果有更新则显示提示和更新按钮。
+    检查 GitHub 最新 Release，强制绕过 SSL 验证（适用于打包后的环境）。
     """
-    system = platform.system()
-    if system == 'Darwin':
+    import platform
+    import webbrowser
+    import requests
+    import urllib3
+
+    # Mac 分支（保持不变）
+    if platform.system() == 'Darwin':
         st.info("📢 发现新版本，请前往 GitHub Releases 手动下载并替换 .app 文件。")
         if st.button("🌐 前往下载页面"):
-            import webbrowser
             webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
         return
-    api_url = "https://api.github.com/repos/Blue-ringedOctopus/Aurum/releases/latest"  # 替换为你的仓库
+
+    # 禁用 SSL 警告（因为我们要使用 verify=False）
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    api_url = "https://api.github.com/repos/Blue-ringedOctopus/Aurum/releases/latest"
+
     try:
-        resp = requests.get(api_url, timeout=10)
-        if resp.status_code == 200:
-            release = resp.json()
-            latest_version = release.get("tag_name", "").lstrip('v')
-            if latest_version > CURRENT_VERSION:
-                st.info(f"📢 发现新版本 {latest_version}！")
-                # 查找 .zip 资产（仅支持完整包）
-                assets = release.get("assets", [])
-                zip_asset = None
-                for asset in assets:
-                    if asset["name"].endswith(".zip"):
-                        zip_asset = asset
-                        break
-                if zip_asset:
-                    download_url = zip_asset["browser_download_url"]
-                    if st.button("⚡ 立即更新"):
-                        perform_update(download_url)
-                else:
-                    st.warning("未找到完整安装包 (.zip)，请前往 GitHub 手动下载。")
-            else:
-                st.success("您已是最新版本！")
-        else:
+        # 强制不使用证书验证
+        resp = requests.get(api_url, timeout=10, verify=False)
+        if resp.status_code != 200:
             st.warning("无法检查更新，请稍后重试。")
+            return
+
+        release = resp.json()
+        latest_version = release.get("tag_name", "").lstrip('v')
+        if latest_version <= CURRENT_VERSION:
+            if not show_ignore:
+                st.toast("您已是最新版本！", icon="✅")
+            return
+
+        # 检查是否已忽略此版本
+        ignored = st.session_state.get('ignored_version', None)
+        if ignored == latest_version:
+            if show_ignore:
+                st.info(f"您已忽略版本 {latest_version}，如需更新请手动操作。")
+                if st.button("🌐 前往下载"):
+                    webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
+            return
+
+        # 显示更新提示
+        st.info(f"📢 发现新版本 {latest_version}！")
+        assets = release.get("assets", [])
+        zip_asset = next((a for a in assets if a["name"].endswith(".zip")), None)
+        if not zip_asset:
+            st.warning("未找到完整的安装包 (.zip)，请手动下载。")
+            return
+
+        download_url = zip_asset["browser_download_url"]
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            if st.button("⚡ 立即更新", use_container_width=True):
+                perform_update(download_url)
+        if show_ignore:
+            with col3:
+                if st.button("本次忽略", use_container_width=True):
+                    st.session_state.ignored_version = latest_version
+                    st.rerun()
+
     except Exception as e:
-        st.warning(f"检查更新失败：{e}")
+        st.error(f"检查更新失败：{e}")
 
 def perform_update(download_url):
     """
     下载新版本的 .zip 压缩包，解压并覆盖旧文件（保留 config.yaml 和 aurum_index.db）。
     """
+    import os
+    import sys
+    import tempfile
+    import zipfile
+    import shutil
+    import subprocess
+    import time
+    import requests
+    import webbrowser
+    import urllib3
+
+    # 禁用 SSL 警告
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     try:
-        # 代理列表（按速度与稳定性排序）
+        # 代理列表（国内镜像）
         PROXY_LIST = [
             "https://ghproxy.com/",
             "https://ghproxy.net/",
@@ -83,21 +147,20 @@ def perform_update(download_url):
         ]
         urls_to_try = [download_url] + [proxy + download_url for proxy in PROXY_LIST]
 
-        # 准备临时文件
         temp_zip = os.path.join(tempfile.gettempdir(), "Aurum_update.zip")
         downloaded = False
 
-        # 尝试下载
         for url in urls_to_try:
             try:
-                response = requests.get(url, stream=True, timeout=30)
+                # 强制不使用证书验证
+                response = requests.get(url, stream=True, timeout=30, verify=False)
                 if response.status_code == 200:
                     with open(temp_zip, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=8192):
                             f.write(chunk)
                     downloaded = True
                     break
-            except:
+            except Exception:
                 continue
 
         if not downloaded:
@@ -121,7 +184,7 @@ def perform_update(download_url):
 
         st.info("正在替换文件（保留您的配置和数据库）...")
 
-        # 复制所有文件，但跳过 config.yaml 和 aurum_index.db
+        # 复制所有文件（跳过 config.yaml 和 aurum_index.db）
         for root, dirs, files in os.walk(extract_dir):
             rel_path = os.path.relpath(root, extract_dir)
             if rel_path == '.':
@@ -190,6 +253,11 @@ def save_config(config):
 
 # --- 页面配置 ---
 st.set_page_config(page_title="Aurum", page_icon="📜")
+
+# --- 预先设置 SSL 证书环境变量（解决打包后 SSL 验证问题） ---
+cert_path = get_cert_path()
+if cert_path:
+    os.environ['SSL_CERT_FILE'] = cert_path
 
 # --- 数据库初始化 ---
 db_path = "aurum_index.db"
@@ -384,6 +452,11 @@ else:
     st.title("📜 Aurum - 中医病历智能整理")
     st.write(f"欢迎, **{username}**! 你已成功登录。")
 
+    # 启动时自动检查更新（仅一次）
+    if 'checked_update' not in st.session_state:
+        check_for_updates(show_ignore=True)
+        st.session_state.checked_update = True
+
     tab1, tab2, tab3 = st.tabs(["📂 归档整理", "📊 数据库浏览", "🤖 智能体"])
     with tab1:
         render_tab1()
@@ -484,7 +557,7 @@ else:
         st.sidebar.divider()
         # 在侧边栏合适位置（比如在设置区域后面）
         if st.sidebar.button("🔍 检查更新"):
-            check_for_updates()
+            check_for_updates(show_ignore=False)
         st.sidebar.caption(f"版本 v{CURRENT_VERSION}")
         st.sidebar.caption("联系我们：aurumdeveloper@yeah.net")
 

@@ -6,6 +6,7 @@ import os
 import json
 import streamlit as st
 import pandas as pd
+from aurum_core.utils import open_folder
 
 def patient_selector(key_prefix: str = "") -> tuple:
     """
@@ -62,8 +63,8 @@ def folder_opener(patient_name: str, visit_date: str, key_prefix: str = ""):
         if docx_path and os.path.exists(docx_path):
             folder_path = os.path.dirname(docx_path)
             try:
-                os.startfile(folder_path)
-                st.toast(f"已打开文件夹：{folder_path}", icon="📁", duration=5)
+                open_folder(folder_path)  # 替换为跨平台函数
+                st.toast(f"✅ 已打开文件夹：{folder_path}", icon="📁", duration=5)
             except Exception as e:
                 st.error(f"❌ 打开文件夹失败：{e}")
         else:

@@ -17,22 +17,35 @@ def read_file_content(file_path: str) -> str:
             doc = Document(file_path)
             return "\n".join([p.text for p in doc.paragraphs])
         elif ext == '.doc':
-            # 使用 pywin32 读取 .doc 文件
-            import win32com.client
-            import pythoncom
-            pythoncom.CoInitialize()
-            word = win32com.client.Dispatch("Word.Application")
-            word.Visible = False
-            doc = word.Documents.Open(file_path)
-            content = doc.Content.Text
-            doc.Close()
-            word.Quit()
-            return content
+            import platform
+            if platform.system() == 'Windows':
+                import win32com.client
+                import pythoncom
+                pythoncom.CoInitialize()
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False
+                doc = word.Documents.Open(file_path)
+                content = doc.Content.Text
+                doc.Close()
+                word.Quit()
+                return content
         elif ext == '.txt':
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.read()
         else:
-            return ""
+            # Mac/Linux：使用系统命令 textutil（Mac 自带）
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ['textutil', '-convert', 'txt', '-output', '-', file_path],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    return result.stdout
+                else:
+                    return ""
+            except:
+                return ""
     except Exception:
         return ""
 
