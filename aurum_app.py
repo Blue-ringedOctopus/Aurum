@@ -12,7 +12,7 @@ from aurum_core.database import init_database, upgrade_database
 from aurum_core.utils import open_folder
 
 # 当前版本号（每次发布新版本时手动更新）
-CURRENT_VERSION = "1.0.1"  # 请根据实际版本修改
+CURRENT_VERSION = "1.0.0"  # 请根据实际版本修改
 
 # 你的 GitHub 用户名和仓库名
 GITHUB_REPO = "Blue-ringedOctopus/Aurum"  # 替换为你的用户名和仓库名
@@ -56,78 +56,52 @@ def get_cert_path():
 
 def check_for_updates(show_ignore: bool = True):
     """
-    检查 GitHub 最新 Release，强制绕过 SSL 验证（适用于打包后的环境）。
-    增加布局优化：忽略在左，更新在右，等宽，靠右显示。
+    检查 GitHub 最新版本，显示提示并提供手动下载链接。
+    出错时显示明确的错误信息。
     """
     import platform
     import webbrowser
     import requests
     import urllib3
 
+    # macOS 特殊处理
     if platform.system() == 'Darwin':
-        st.info("📢 发现新版本，请前往 GitHub Releases 手动下载并替换 .app 文件。")
+        st.info("📢 请前往 GitHub Releases 手动下载最新版本。")
         if st.button("🌐 前往下载页面"):
             webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
         return
 
+    # 禁用 SSL 警告（因为 verify=False）
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     api_url = "https://api.github.com/repos/Blue-ringedOctopus/Aurum/releases/latest"
 
     try:
+        # 请求最新 Release 信息
         resp = requests.get(api_url, timeout=10, verify=False)
-        if resp.status_code != 200:
-            st.warning("无法检查更新，请稍后重试。")
-            return
-
+        resp.raise_for_status()  # 如果状态码不是 200，抛出异常
         release = resp.json()
         latest_version = release.get("tag_name", "").lstrip('v')
+
+        if not latest_version:
+            st.error("无法解析版本信息，请稍后重试或手动访问 GitHub Releases。")
+            return
+
+        # 比较版本
         if latest_version <= CURRENT_VERSION:
-            if not show_ignore:
-                st.toast("您已是最新版本！", icon="✅")
+            st.success(f"✅ 您已是最新版本 (v{CURRENT_VERSION})")
             return
 
-        ignored = st.session_state.get('ignored_version', None)
-        if ignored == latest_version:
-            if show_ignore:
-                st.info(f"您已忽略版本 {latest_version}，如需更新请手动操作。")
-                if st.button("🌐 前往下载"):
-                    webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
-            return
+        # 有新版本
+        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})，请手动下载更新。")
+        if st.button("🌐 前往下载", use_container_width=True):
+            webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
 
-        # ---- 显示更新提示（info 单独一行） ----
-        st.info(f"📢 发现新版本 **{latest_version}**！")
-
-        assets = release.get("assets", [])
-        zip_asset = next((a for a in assets if a["name"].endswith(".zip")), None)
-        if not zip_asset:
-            st.warning("未找到完整的安装包 (.zip)，请手动下载。")
-            return
-
-        download_url = zip_asset["browser_download_url"]
-
-        # ---- 按钮行：忽略在左，更新在右，等宽靠右 ----
-        col_left, col_right = st.columns([3, 2])  # 左侧留空，右侧两列等宽
-        with col_right:
-            col_ignore, col_update = st.columns(2)
-            if show_ignore:
-                with col_ignore:
-                    if st.button("⏭️ 本次忽略", use_container_width=True):
-                        st.session_state.ignored_version = latest_version
-                        st.rerun()
-            with col_update:
-                if st.button("⚡ 立即更新", use_container_width=True, type="primary"):
-                    # 用 status 显示更新进度
-                    with st.status("正在下载更新，请稍候...", expanded=True) as status:
-                        try:
-                            perform_update(download_url)
-                        except Exception as e:
-                            status.update(label="❌ 更新失败", state="error")
-                            st.error(f"更新过程中出现异常：{e}")
-                            return
-                        status.update(label="✅ 更新完成，程序即将重启", state="complete")
-
+    except requests.exceptions.RequestException as e:
+        st.error(f"网络请求失败：{e}\n请检查网络连接后重试，或手动访问 GitHub Releases。")
+    except ValueError as e:
+        st.error(f"解析版本信息失败：{e}\n请稍后重试，或手动访问 GitHub Releases。")
     except Exception as e:
-        st.error(f"检查更新失败：{e}")
+        st.error(f"检查更新时发生未知错误：{e}\n请手动访问 GitHub Releases 查看最新版本。")
 
 def perform_update(download_url):
     """
@@ -576,7 +550,7 @@ else:
         # ---- 版本号 + 联系方式 ----
         st.sidebar.divider()
         # 在侧边栏合适位置（比如在设置区域后面）
-        if st.sidebar.button("🔍 检查更新"):
+        if st.sidebar.button("🔍 检查更新", use_container_width=True):
             check_for_updates(show_ignore=False)
         st.sidebar.caption(f"版本 v{CURRENT_VERSION}")
         st.sidebar.caption("联系我们：aurumdeveloper@yeah.net")
