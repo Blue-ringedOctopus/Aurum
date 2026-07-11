@@ -1,0 +1,10 @@
+[server]
+# 开启热重载
+runOnSave = true
+
+[runner]
+# 监视整个项目目录的文件变化
+watchDirectory = true
+
+# 增加监视的文件夹深度（默认已经足够，但写出来更保险）
+folderWatchBlacklist = []

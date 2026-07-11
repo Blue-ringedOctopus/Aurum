@@ -1,0 +1,40 @@
+name: Build macOS Executable
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: List files (debug)
+        run: |
+          pwd
+          ls -la
+
+      - name: Install dependencies
+        run: |
+          pwd
+          ls -la
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --name Aurum --add-data "aurum_core:aurum_core" --add-data "aurum_app.py:." --add-data "config.yaml:." --hidden-import streamlit --hidden-import pandas --hidden-import openai --hidden-import docx --hidden-import pypinyin --hidden-import bcrypt --hidden-import yaml --collect-all streamlit run.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aurum-macOS
+          path: dist/Aurum

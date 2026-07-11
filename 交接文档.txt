@@ -1,0 +1,52 @@
+【项目名称】Aurum - 中医病历智能整理工具
+【当前状态】已完成第一个可用版本，已打包发给同学测试（Windows + Mac）
+
+【项目定位】
+一个帮助中医学生/临床医生整理病历的桌面工具。输入散落在各日期文件夹里的患者资料，自动重组为“医院/患者/就诊日期”结构，存入SQLite数据库，支持搜索、筛选、分组、批量编辑，并提供AI辅助功能（证型识别、方剂识别、按语生成）。
+
+【技术栈】
+- Python 3.11
+- Streamlit（Web界面）
+- SQLite（本地数据库）
+- PyInstaller（Windows打包）
+- GitHub Actions（Mac自动打包）
+- DeepSeek API（AI推理）
+
+【核心模块及文件】
+- aurum_app.py：主入口，登录/注册/路由
+- aurum_core/tab1.py：归档整理
+- aurum_core/tab2.py：智能体（诊断识别、方剂识别、按语生成）
+- aurum_core/tab3.py：数据库浏览（搜索/筛选/批量编辑/删除）
+- aurum_core/file_processor.py：文件重组、索引、重建
+- aurum_core/database.py：数据库初始化、升级、查询
+- aurum_core/deidentifier.py：脱敏模块（本地处理，仅脱敏文本发往云端）
+- aurum_core/text_utils.py：文本提取、诊断解析、敏感信息检测
+- aurum_core/llm_agent.py + llm_tools.py：大模型调用封装
+- aurum_core/extract_patient_profiles.py：患者档案自动提取（独立脚本，保留）
+- run.py：PyInstaller入口文件（位于根目录，不在aurum_core下）
+
+【关键设计决策（请继承）】
+1. 数据流：文件层（归档）→ 数据层（SQLite）→ 智能层（AI推理），从左到右。
+2. 脱敏：本地处理原始文本，仅脱敏后的医学描述发送给DeepSeek API。
+3. 诊断提取：跨行匹配，遇到下一个字段标签自动截断（“方药：”“舌脉：”等）。
+4. 分组：患者级分组（patient_group）和就诊级标记（visit_mark）并存。
+5. UI习惯：完全听用户的想法。
+
+【未来待开发功能】
+1. 本地OCR：集成PaddleOCR或Tesseract识别图片文字
+2. 预处理文件夹工具：帮助用户把杂乱的原始文件夹整理成Aurum能识别的格式
+3. 识别中医诊断、西医诊断
+
+【本次对话最后达成的内容】
+- 已成功打包Windows版（--onedir，启动快）
+- 已通过GitHub Actions打包Mac版（从Actions下载）
+- Mac版打开需右键→“打开”绕过Gatekeeper
+- 误传的aurum_core/run.py已删除
+- requirements.txt已上传，Actions可正常打包
+- GitHub Token需包含repo + workflow权限
+
+【下次回来时需要确认的】
+- 如果有新功能需求，优先洗患者姓名（改动最小）
+- 如果重新打包，用pyinstaller --onedir ...（启动快，不是--onefile）
+- 如果要更新，记得先删除build/和dist/再打包
+- 发给同学的版本不用包含开发中的测试脚本

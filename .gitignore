@@ -1,0 +1,29 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+.venv/
+venv/
+
+# 打包输出
+dist/
+build/
+*.spec
+*.rar
+*.zip
+*.7z
+
+# 用户数据（绝对不能上传）
+aurum_index.db
+config.yaml
+
+# 临时文件
+*.log
+*.tmp
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
