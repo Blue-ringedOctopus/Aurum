@@ -12,7 +12,7 @@ from aurum_core.database import init_database, upgrade_database
 from aurum_core.utils import open_folder
 
 # 当前版本号（每次发布新版本时手动更新）
-CURRENT_VERSION = "1.0.1"  # 请根据实际版本修改
+CURRENT_VERSION = "1.0.0"  # 请根据实际版本修改
 
 # 你的 GitHub 用户名和仓库名
 GITHUB_REPO = "Blue-ringedOctopus/Aurum"  # 替换为你的用户名和仓库名
@@ -57,26 +57,23 @@ def get_cert_path():
 def check_for_updates(show_ignore: bool = True):
     """
     检查 GitHub 最新 Release，强制绕过 SSL 验证（适用于打包后的环境）。
+    增加布局优化：忽略在左，更新在右，等宽，靠右显示。
     """
     import platform
     import webbrowser
     import requests
     import urllib3
 
-    # Mac 分支（保持不变）
     if platform.system() == 'Darwin':
         st.info("📢 发现新版本，请前往 GitHub Releases 手动下载并替换 .app 文件。")
         if st.button("🌐 前往下载页面"):
             webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
         return
 
-    # 禁用 SSL 警告（因为我们要使用 verify=False）
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
     api_url = "https://api.github.com/repos/Blue-ringedOctopus/Aurum/releases/latest"
 
     try:
-        # 强制不使用证书验证
         resp = requests.get(api_url, timeout=10, verify=False)
         if resp.status_code != 200:
             st.warning("无法检查更新，请稍后重试。")
@@ -89,7 +86,6 @@ def check_for_updates(show_ignore: bool = True):
                 st.toast("您已是最新版本！", icon="✅")
             return
 
-        # 检查是否已忽略此版本
         ignored = st.session_state.get('ignored_version', None)
         if ignored == latest_version:
             if show_ignore:
@@ -98,8 +94,9 @@ def check_for_updates(show_ignore: bool = True):
                     webbrowser.open("https://github.com/Blue-ringedOctopus/Aurum/releases/latest")
             return
 
-        # 显示更新提示
-        st.info(f"📢 发现新版本 {latest_version}！")
+        # ---- 显示更新提示（info 单独一行） ----
+        st.info(f"📢 发现新版本 **{latest_version}**！")
+
         assets = release.get("assets", [])
         zip_asset = next((a for a in assets if a["name"].endswith(".zip")), None)
         if not zip_asset:
@@ -107,15 +104,27 @@ def check_for_updates(show_ignore: bool = True):
             return
 
         download_url = zip_asset["browser_download_url"]
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            if st.button("⚡ 立即更新", use_container_width=True):
-                perform_update(download_url)
-        if show_ignore:
-            with col3:
-                if st.button("本次忽略", use_container_width=True):
-                    st.session_state.ignored_version = latest_version
-                    st.rerun()
+
+        # ---- 按钮行：忽略在左，更新在右，等宽靠右 ----
+        col_left, col_right = st.columns([3, 2])  # 左侧留空，右侧两列等宽
+        with col_right:
+            col_ignore, col_update = st.columns(2)
+            if show_ignore:
+                with col_ignore:
+                    if st.button("⏭️ 本次忽略", use_container_width=True):
+                        st.session_state.ignored_version = latest_version
+                        st.rerun()
+            with col_update:
+                if st.button("⚡ 立即更新", use_container_width=True, type="primary"):
+                    # 用 status 显示更新进度
+                    with st.status("正在下载更新，请稍候...", expanded=True) as status:
+                        try:
+                            perform_update(download_url)
+                        except Exception as e:
+                            status.update(label="❌ 更新失败", state="error")
+                            st.error(f"更新过程中出现异常：{e}")
+                            return
+                        status.update(label="✅ 更新完成，程序即将重启", state="complete")
 
     except Exception as e:
         st.error(f"检查更新失败：{e}")
@@ -123,6 +132,7 @@ def check_for_updates(show_ignore: bool = True):
 def perform_update(download_url):
     """
     下载新版本的 .zip 压缩包，解压并覆盖旧文件（保留 config.yaml 和 aurum_index.db）。
+    增加详细的状态反馈。
     """
     import os
     import sys
@@ -135,11 +145,12 @@ def perform_update(download_url):
     import webbrowser
     import urllib3
 
-    # 禁用 SSL 警告
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     try:
-        # 代理列表（国内镜像）
+        # 开始提示
+        st.toast("🚀 开始更新...", icon="⬇️")
+
         PROXY_LIST = [
             "https://ghproxy.com/",
             "https://ghproxy.net/",
@@ -150,18 +161,26 @@ def perform_update(download_url):
         temp_zip = os.path.join(tempfile.gettempdir(), "Aurum_update.zip")
         downloaded = False
 
-        for url in urls_to_try:
-            try:
-                # 强制不使用证书验证
-                response = requests.get(url, stream=True, timeout=30, verify=False)
-                if response.status_code == 200:
-                    with open(temp_zip, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    downloaded = True
-                    break
-            except Exception:
-                continue
+        # 下载
+        with st.spinner("正在下载更新包..."):
+            for url in urls_to_try:
+                try:
+                    response = requests.get(url, stream=True, timeout=30, verify=False)
+                    if response.status_code == 200:
+                        total_size = int(response.headers.get('content-length', 0))
+                        progress_bar = st.progress(0, text="下载进度")
+                        downloaded_bytes = 0
+                        with open(temp_zip, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                if total_size > 0:
+                                    progress_bar.progress(min(downloaded_bytes / total_size, 1.0))
+                        progress_bar.empty()
+                        downloaded = True
+                        break
+                except Exception:
+                    continue
 
         if not downloaded:
             st.error("下载失败，请检查网络或前往 GitHub Releases 手动下载。")
@@ -171,7 +190,7 @@ def perform_update(download_url):
 
         st.success("下载完成，正在解压...")
 
-        # 解压到临时文件夹
+        # 解压
         extract_dir = tempfile.mkdtemp()
         with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
@@ -184,7 +203,7 @@ def perform_update(download_url):
 
         st.info("正在替换文件（保留您的配置和数据库）...")
 
-        # 复制所有文件（跳过 config.yaml 和 aurum_index.db）
+        # 复制文件
         for root, dirs, files in os.walk(extract_dir):
             rel_path = os.path.relpath(root, extract_dir)
             if rel_path == '.':
@@ -207,8 +226,9 @@ def perform_update(download_url):
         shutil.rmtree(extract_dir, ignore_errors=True)
         os.remove(temp_zip)
 
-        st.success("更新完成！程序将自动重启。")
-        time.sleep(2)
+        # 显示成功并延迟退出
+        st.success("🎉 更新完成！程序将自动重启。")
+        time.sleep(3)
 
         # 重启程序
         if getattr(sys, 'frozen', False):
@@ -219,7 +239,7 @@ def perform_update(download_url):
 
     except Exception as e:
         st.error(f"❌ 更新失败：{e}")
-        # 尝试清理临时文件
+        # 清理临时文件
         try:
             if os.path.exists(temp_zip):
                 os.remove(temp_zip)
