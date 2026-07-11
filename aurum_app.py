@@ -56,28 +56,25 @@ def get_cert_path():
 
 def check_for_updates(show_ignore: bool = True):
     """
-    检查 GitHub 最新版本，显示提示并提供手动下载链接。
+    检查 GitHub 最新版本，显示提示，并提供“本次忽略”按钮和下载超链接（右侧布局）。
     出错时显示明确的错误信息。
     """
     import platform
-    import webbrowser
     import requests
     import urllib3
 
     # macOS 特殊处理
     if platform.system() == 'Darwin':
-        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})")
+        st.info("📢 请前往 GitHub Releases 手动下载最新版本。")
         st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
         return
 
-    # 禁用 SSL 警告（因为 verify=False）
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     api_url = "https://api.github.com/repos/Blue-ringedOctopus/Aurum/releases/latest"
 
     try:
-        # 请求最新 Release 信息
         resp = requests.get(api_url, timeout=10, verify=False)
-        resp.raise_for_status()  # 如果状态码不是 200，抛出异常
+        resp.raise_for_status()
         release = resp.json()
         latest_version = release.get("tag_name", "").lstrip('v')
 
@@ -85,14 +82,30 @@ def check_for_updates(show_ignore: bool = True):
             st.error("无法解析版本信息，请稍后重试或手动访问 GitHub Releases。")
             return
 
-        # 比较版本
         if latest_version <= CURRENT_VERSION:
             st.success(f"✅ 您已是最新版本 (v{CURRENT_VERSION})")
             return
 
-        # 有新版本
-        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})")
-        st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
+        # ---------- 有新版本：显示信息 + 右侧操作 ----------
+        # 1. 显示信息
+        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})，请手动下载更新。")
+
+        # 2. 右侧布局：忽略按钮（左） + 下载超链接（右），等宽靠右
+        #    使用两列，左侧留空，右侧两列等宽
+        col_left, col_right = st.columns([3, 2])  # 左侧占 3 份，右侧占 2 份（让右侧靠右）
+        with col_right:
+            col_ignore, col_download = st.columns(2)
+            with col_ignore:
+                if show_ignore:
+                    if st.button("⏭️ 本次忽略", use_container_width=True):
+                        st.session_state.ignored_version = latest_version
+                        st.rerun()
+            with col_download:
+                # 使用超链接（通过 st.markdown 渲染）
+                st.markdown(
+                    "[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)",
+                    unsafe_allow_html=True
+                )
 
     except requests.exceptions.RequestException as e:
         st.error(f"网络请求失败：{e}\n请检查网络连接后重试，或手动访问 GitHub Releases。")
