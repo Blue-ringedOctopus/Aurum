@@ -3,8 +3,8 @@ name: Build Aurum
 on:
   push:
     tags:
-      - 'v*'             # 推送版本标签时自动构建
-  workflow_dispatch:     # 允许手动触发
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -15,10 +15,10 @@ jobs:
         include:
           - os: windows-latest
             output_name: Aurum_Windows
-            pyinstaller_args: --onedir --noconsole --icon=Aurum.ico
+            pyinstaller_args: --onedir --noconsole --icon=Aurum.ico --add-data "aurum_core;aurum_core" --add-data "README.txt;." --add-data "aurum_app.py;."
           - os: macos-latest
             output_name: Aurum_macOS
-            pyinstaller_args: --onedir --noconsole --icon=Aurum.icns  # 若没有 .icns 可去掉 --icon
+            pyinstaller_args: --onedir --noconsole --icon=Aurum.icns --add-data "aurum_core:aurum_core" --add-data "README.txt:." --add-data "aurum_app.py:."
 
     steps:
       - name: Checkout code
@@ -29,26 +29,30 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (通用)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt  # 如果您有 requirements.txt
-          pip install pyinstaller
+          pip install streamlit pyinstaller pypinyin python-docx openai pyyaml bcrypt pandas requests packaging psutil
+
+      - name: Install Windows-specific dependencies
+        if: matrix.os == 'windows-latest'
+        run: |
+          pip install pywin32
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller ${{ matrix.pyinstaller_args }} --name Aurum --add-data "aurum_core;aurum_core" --add-data "README.txt;." --add-data "aurum_app.py;." --hidden-import streamlit --hidden-import streamlit.web --hidden-import streamlit.web.cli --hidden-import pypinyin --hidden-import docx --hidden-import openai --hidden-import yaml --hidden-import bcrypt --hidden-import pandas --hidden-import requests --hidden-import packaging --collect-all streamlit --collect-all certifi run.py
+          pyinstaller ${{ matrix.pyinstaller_args }} --name Aurum --hidden-import streamlit --hidden-import streamlit.web --hidden-import streamlit.web.cli --hidden-import pypinyin --hidden-import docx --hidden-import openai --hidden-import yaml --hidden-import bcrypt --hidden-import pandas --hidden-import requests --hidden-import packaging --collect-all streamlit --collect-all certifi run.py
 
       - name: Upload Windows artifact
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: Aurum_v1.0.0_Windows
+          name: ${{ matrix.output_name }}
           path: dist/Aurum/
 
       - name: Upload macOS artifact
         if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: Aurum_v1.0.0_macOS
+          name: ${{ matrix.output_name }}
           path: dist/Aurum/

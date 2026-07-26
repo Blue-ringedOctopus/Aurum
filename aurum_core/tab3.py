@@ -6,15 +6,14 @@ import pandas as pd
 from aurum_core.ui_components import edit_record_ui, render_batch_tag_editor
 from aurum_core.delete_handler import delete_records_clean
 from aurum_core.database import load_all_visits_with_tags
+from aurum_core.utils import open_folder
 
 def render_tab3():
     import sqlite3
     # ---- 显示挂起的消息（跨 rerun 持久） ----
     if 'pending_toast' in st.session_state and st.session_state.pending_toast:
         st.toast(st.session_state.pending_toast, icon="✅", duration=5)
-        # 清除消息，防止重复显示
         del st.session_state.pending_toast
-    # ---- 显示挂起的警告（跨 rerun 持久） ----
     if 'pending_warning' in st.session_state and st.session_state.pending_warning:
         st.warning(st.session_state.pending_warning)
         del st.session_state.pending_warning
@@ -23,13 +22,11 @@ def render_tab3():
         del st.session_state.pending_error
 
     db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "aurum_index.db")
-    # 表结构已在启动时由 database.init_database 确保，无需再调用 ensure_tables
 
-    # ---- 初始化手动选择列表 ----
     if 'manual_selection' not in st.session_state:
         st.session_state.manual_selection = []
 
-    # ---- 标题行 + 提示按钮 ----
+    # ---- 标题行 ----
     col_title, col_icon = st.columns([6, 1], vertical_alignment="bottom")
     with col_title:
         st.header("📊 数据库浏览")
@@ -58,12 +55,10 @@ def render_tab3():
 
     # ---- 加载数据 ----
     df = load_all_visits_with_tags(db_path)
-
     if df.empty:
         st.info("📭 数据库为空，请先运行归档和索引。")
         return
 
-    # ---- 数据预处理 ----
     df = df.fillna('')
 
     def parse_json_list(val):
@@ -90,62 +85,87 @@ def render_tab3():
     all_marks = [row[0] for row in cursor.fetchall()]
     conn.close()
 
-    # ---- 构建带前缀的选项列表 ----
-    tagged_options = []
-    for g in all_groups:
-        tagged_options.append(f"🏷️ {g}")
-    for m in all_marks:
-        tagged_options.append(f"📌 {m}")
+    tagged_options = [f"🏷️ {g}" for g in all_groups] + [f"📌 {m}" for m in all_marks]
 
-    # ---- 从 session_state 读取筛选值，并过滤无效选项 ----
+    # ---- 从 session_state 读取筛选值 ----
     selected_tagged = st.session_state.get('filter_tagged', [])
-    valid_selected = [v for v in selected_tagged if v in tagged_options]
-    if valid_selected != selected_tagged:
-        st.session_state.filter_tagged = valid_selected
-        selected_tagged = valid_selected
     search_term = st.session_state.get('search_input', "")
     filter_mode = st.session_state.get('filter_mode', "交集")
 
-    # ---- 解析选中的标签（去掉前缀） ----
+    # ---- 强制恢复筛选条件（全选状态丢失时） ----
+    if st.session_state.get('select_all', False) and '_saved_filter' in st.session_state:
+        saved = st.session_state['_saved_filter']
+        if not selected_tagged and saved.get('filter_tagged'):
+            st.session_state.filter_tagged = saved['filter_tagged']
+            st.session_state.search_input = saved.get('search_input', '')
+            st.session_state.filter_mode = saved.get('filter_mode', '交集')
+            st.rerun()
+
+    # ---- 解析选中的标签 ----
     selected_groups = []
     selected_marks = []
     for item in selected_tagged:
-        if item.startswith("🏷️ "):
+        if item.startswith("🏷️ ") and item in tagged_options:
             selected_groups.append(item[2:].strip())
-        elif item.startswith("📌 "):
+        elif item.startswith("📌 ") and item in tagged_options:
             selected_marks.append(item[2:].strip())
 
     # ---- 强制确保标记列为列表类型 ----
     df['就诊标记列表'] = df['就诊标记列表'].apply(lambda x: x if isinstance(x, list) else [])
 
-    # ---- 逐步筛选 ----
-    filtered_df = df.copy()
+    # ---- 筛选逻辑 ----
+    has_selection = bool(selected_groups) or bool(selected_marks)
 
-    # 1. 分组筛选
-    if selected_groups:
+    if has_selection:
         if filter_mode == "交集":
-            group_mask = filtered_df['患者分组列表'].apply(
-                lambda tags: all(g in tags for g in selected_groups) if isinstance(tags, list) else False
-            )
-        else:  # 并集
-            group_mask = filtered_df['患者分组列表'].apply(
-                lambda tags: any(g in tags for g in selected_groups) if isinstance(tags, list) else False
-            )
-        filtered_df = filtered_df[group_mask]
+            mask = pd.Series([True] * len(df))
+            if selected_groups:
+                mask &= df['患者分组列表'].apply(
+                    lambda tags: all(g in tags for g in selected_groups) if isinstance(tags, list) else False
+                )
+            if selected_marks:
+                mask &= df['就诊标记列表'].apply(
+                    lambda tags: all(m in tags for m in selected_marks) if isinstance(tags, list) else False
+                )
+        elif filter_mode == "并集":
+            mask = pd.Series([False] * len(df))
+            if selected_groups:
+                mask |= df['患者分组列表'].apply(
+                    lambda tags: any(g in tags for g in selected_groups) if isinstance(tags, list) else False
+                )
+            if selected_marks:
+                mask |= df['就诊标记列表'].apply(
+                    lambda tags: any(m in tags for m in selected_marks) if isinstance(tags, list) else False
+                )
+        elif filter_mode == "交集补":
+            temp_mask = pd.Series([True] * len(df))
+            if selected_groups:
+                temp_mask &= df['患者分组列表'].apply(
+                    lambda tags: all(g in tags for g in selected_groups) if isinstance(tags, list) else False
+                )
+            if selected_marks:
+                temp_mask &= df['就诊标记列表'].apply(
+                    lambda tags: all(m in tags for m in selected_marks) if isinstance(tags, list) else False
+                )
+            mask = ~temp_mask
+        elif filter_mode == "并集补":
+            temp_mask = pd.Series([False] * len(df))
+            if selected_groups:
+                temp_mask |= df['患者分组列表'].apply(
+                    lambda tags: any(g in tags for g in selected_groups) if isinstance(tags, list) else False
+                )
+            if selected_marks:
+                temp_mask |= df['就诊标记列表'].apply(
+                    lambda tags: any(m in tags for m in selected_marks) if isinstance(tags, list) else False
+                )
+            mask = ~temp_mask
+        else:
+            mask = pd.Series([True] * len(df))
+        filtered_df = df[mask]
+    else:
+        filtered_df = df.copy()
 
-    # 2. 标记筛选
-    if selected_marks:
-        if filter_mode == "交集":
-            mark_mask = filtered_df['就诊标记列表'].apply(
-                lambda tags: all(m in tags for m in selected_marks) if isinstance(tags, list) else False
-            )
-        else:  # 并集
-            mark_mask = filtered_df['就诊标记列表'].apply(
-                lambda tags: any(m in tags for m in selected_marks) if isinstance(tags, list) else False
-            )
-        filtered_df = filtered_df[mark_mask]
-
-    # 3. 搜索（如果 search_term 非空）
+    # 搜索
     if search_term:
         search_mask = filtered_df.apply(
             lambda row: row.astype(str).str.contains(search_term, case=False).any(), axis=1
@@ -159,22 +179,31 @@ def render_tab3():
         from pypinyin import pinyin, Style
         def get_pinyin(name):
             return ''.join([p[0] for p in pinyin(name, style=Style.NORMAL)])
-
         display_df['_pinyin'] = display_df['患者姓名'].apply(get_pinyin)
-        display_df = display_df.sort_values('_pinyin').drop('_pinyin', axis=1)
-        display_df = display_df.reset_index(drop=True)
+        display_df = display_df.sort_values('_pinyin').drop('_pinyin', axis=1).reset_index(drop=True)
 
-    # ---- 绘制顶部控制行 ----
+    # ---- 顶部控制行 ----
     col_all, col_mode, col_tags, col_search = st.columns([1, 1, 2, 2])
 
     with col_all:
         if st.session_state.get('select_all', False):
             if st.button("❌ 取消全选", use_container_width=True, key="deselect_all_top"):
+                # 保存当前的筛选条件，防止 rerun 后被重置
+                saved_filter = st.session_state.get('filter_tagged', [])
                 st.session_state['select_all'] = False
                 st.session_state.pop('selected_all_df', None)
+                st.session_state.pop('_saved_filter', None)
+                # 显式恢复筛选条件
+                st.session_state['filter_tagged'] = saved_filter
                 st.rerun()
         else:
             if st.button("✅ 全选", use_container_width=True, key="select_all_top"):
+                # 保存当前筛选条件
+                st.session_state['_saved_filter'] = {
+                    'filter_tagged': selected_tagged,
+                    'search_input': search_term,
+                    'filter_mode': filter_mode
+                }
                 st.session_state['select_all'] = True
                 st.session_state['selected_all_df'] = display_df.copy()
                 st.rerun()
@@ -182,8 +211,8 @@ def render_tab3():
     with col_mode:
         st.selectbox(
             "筛选方式",
-            ["交集", "并集"],
-            index=["交集", "并集"].index(filter_mode),
+            ["交集", "并集", "交集补", "并集补"],
+            index=["交集", "并集", "交集补", "并集补"].index(filter_mode),
             key="filter_mode",
             label_visibility="collapsed"
         )
@@ -192,7 +221,6 @@ def render_tab3():
         st.multiselect(
             "筛选标签",
             options=tagged_options,
-            default=selected_tagged,
             key="filter_tagged",
             placeholder="选择分组/标记",
             label_visibility="collapsed"
@@ -207,7 +235,7 @@ def render_tab3():
             label_visibility="collapsed"
         )
 
-    # ---- 分页参数 ----
+    # ---- 分页 ----
     page_size = st.session_state.get("page_size_control", 20)
     current_page = st.session_state.get("table_pagination", 1)
     total_pages = max(1, (len(display_df) - 1) // page_size + 1) if len(display_df) > 0 else 1
@@ -219,7 +247,7 @@ def render_tab3():
     end_idx = min(start_idx + page_size, len(display_df)) if len(display_df) > 0 else 0
     page_df = display_df.iloc[start_idx:end_idx] if len(display_df) > 0 else pd.DataFrame(columns=display_df.columns)
 
-    # ---- 显示当前状态 ----
+    # ---- 显示状态 ----
     filter_info = []
     if selected_groups:
         filter_info.append(f"分组: {'+'.join(selected_groups)}")
@@ -228,23 +256,23 @@ def render_tab3():
     filter_str = " | ".join(filter_info) if filter_info else "全部"
     base_info = f"共 {len(display_df)} 条 | 筛选: {filter_str} | 搜索: {search_term if search_term else '无'} | 第 {start_idx + 1}–{end_idx} 条"
     if st.session_state.get('select_all', False):
-        base_info += f" | ✅ 已全选"
+        total_selected = len(st.session_state.get('selected_all_df', pd.DataFrame()))
+        base_info += f" | ✅ 已全选当前结果（{total_selected} 条）"
     st.caption(base_info)
 
-    # ---- 格式化标签显示 ----
+    # ---- 格式化标签 ----
     def format_tags(tag_list):
         if not tag_list or not isinstance(tag_list, list):
             return ""
         return '、'.join(tag_list)
 
-    display_page_df = page_df.copy()
-    display_page_df = display_page_df.fillna('')
+    display_page_df = page_df.copy().fillna('')
     display_cols_with_tags = [
         '患者姓名', '性别', '出生日期', '电话', '身份证号', '住址', '个人信息备注',
         '就诊日期', '医院/科室', '中医诊断', '西医诊断', '方剂', '病历', '就诊备注'
     ]
 
-    # ---- 显示表格 ----
+    # ---- 表格 ----
     selection = st.dataframe(
         display_page_df[display_cols_with_tags],
         use_container_width=True,
@@ -323,45 +351,57 @@ def render_tab3():
             st.button("📋 已选 0 条记录", use_container_width=True, disabled=True)
 
     with col_btn2:
-        if selected_indices:
-            if st.button("➕ 保留选择", use_container_width=True):
-                for idx in selected_indices:
-                    row = page_df.iloc[idx]
-                    key = (row['患者姓名'], row['就诊日期'])
+        if st.session_state.get('select_all', False):
+            if st.button("➕ 保留全选", use_container_width=True):
+                all_keys = set()
+                for _, row in display_df.iterrows():
+                    all_keys.add((row['患者姓名'], row['就诊日期']))
+                for key in all_keys:
                     if key not in st.session_state.manual_selection:
                         st.session_state.manual_selection.append(key)
+                st.session_state['select_all'] = False
+                st.session_state.pop('selected_all_df', None)
+                st.session_state.pop('_saved_filter', None)
                 st.rerun()
         else:
-            st.button("➕ 保留选择", use_container_width=True, disabled=True)
+            if selected_indices:
+                if st.button("➕ 保留选择", use_container_width=True):
+                    for idx in selected_indices:
+                        row = page_df.iloc[idx]
+                        key = (row['患者姓名'], row['就诊日期'])
+                        if key not in st.session_state.manual_selection:
+                            st.session_state.manual_selection.append(key)
+                    st.rerun()
+            else:
+                st.button("➕ 保留选择", use_container_width=True, disabled=True)
 
     with col_btn3:
         if len(display_df) > 0:
             if st.button("🔄 保留反选", use_container_width=True):
-                # 获取当前页所有记录的键
                 page_keys = set((row['患者姓名'], row['就诊日期']) for _, row in page_df.iterrows())
-                # 获取当前页被勾选的记录的键
                 selected_page_keys = set()
                 for idx in selected_indices:
                     row = page_df.iloc[idx]
                     selected_page_keys.add((row['患者姓名'], row['就诊日期']))
-                # 获取当前已手动选择的集合
                 current_manual = set(st.session_state.manual_selection)
-                # 新选择：保留不在当前页的手动选择
                 new_selection = [key for key in current_manual if key not in page_keys]
-                # 添加当前页中未被勾选的记录（反选：未选则添加，已选则不添加）
                 for key in page_keys:
                     if key not in selected_page_keys:
                         new_selection.append(key)
                 st.session_state.manual_selection = new_selection
                 st.session_state['select_all'] = False
+                st.session_state.pop('_saved_filter', None)
                 st.rerun()
         else:
             st.button("🔄 保留反选", use_container_width=True, disabled=True)
 
     with col_btn4:
-        if manual_count > 0:
+        if manual_count > 0 or st.session_state.get('select_all', False):
             if st.button("❌ 清空选择", use_container_width=True):
                 st.session_state.manual_selection = []
+                st.session_state['select_all'] = False
+                st.session_state.pop('selected_all_df', None)
+                st.session_state.pop('_saved_filter', None)
                 st.rerun()
         else:
             st.button("❌ 清空选择", use_container_width=True, disabled=True)
@@ -372,9 +412,16 @@ def render_tab3():
         if has_single_selection:
             row = page_df.iloc[selected_indices[0]]
             file_path = row.get('文件路径', '')
-            if file_path and os.path.exists(os.path.dirname(file_path)):
+            date_folder_path = row.get('日期文件夹路径', '')
+            # 优先使用 date_folder_path
+            if date_folder_path and os.path.exists(date_folder_path):
+                folder_path = date_folder_path
+            elif file_path and os.path.exists(os.path.dirname(file_path)):
+                folder_path = os.path.dirname(file_path)
+            else:
+                folder_path = None
+            if folder_path:
                 if st.button("📂 打开文件夹", type="primary", use_container_width=True):
-                    folder_path = os.path.dirname(file_path)
                     try:
                         open_folder(folder_path)
                         st.toast(f"✅ 已打开：{folder_path}", icon="📁", duration=5)
@@ -386,14 +433,18 @@ def render_tab3():
             st.button("📂 打开文件夹", disabled=True, use_container_width=True)
 
     with col_download:
-        csv = display_page_df[display_cols_with_tags].to_csv(index=False, encoding='utf-8-sig')
+        import io
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            display_page_df[display_cols_with_tags].to_excel(writer, index=False, sheet_name='数据')
+        excel_data = output.getvalue()
         st.download_button(
-            label="📥 下载 CSV",
-            data=csv,
-            file_name="filtered_data.csv",
-            mime="text/csv",
+            label="📥 下载 Excel",
+            data=excel_data,
+            file_name="filtered_data.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
-            key="download_filtered_csv"
+            key="download_filtered_excel"
         )
 
     with col_delete:
@@ -407,7 +458,6 @@ def render_tab3():
                         sync_enabled=st.session_state.get('sync_delete_enabled', False)
                     )
                 if result['success']:
-                    # 只提示文件夹删除信息，不提示数据库记录删除
                     if result['deleted_folders'] > 0 or result.get('_deleted_hospitals'):
                         msg_parts = []
                         if result['deleted_folders'] > 0:
@@ -415,7 +465,6 @@ def render_tab3():
                         if result.get('_deleted_hospitals'):
                             msg_parts.append(f"已清理 {len(result['_deleted_hospitals'])} 个空的医院文件夹")
                         st.session_state.pending_toast = "✅ " + "；".join(msg_parts)
-                    # 如果没有任何文件夹操作，不提示（数据库记录删除后列表会刷新）
                     else:
                         error_msg = f"❌ {result['message']}"
                         if result['errors']:
@@ -424,6 +473,7 @@ def render_tab3():
                 st.session_state['select_all'] = False
                 st.session_state.pop('selected_all_df', None)
                 st.session_state.manual_selection = []
+                st.session_state.pop('_saved_filter', None)
                 for key in ['search_results', 'search_term', 'group']:
                     if key in st.session_state:
                         del st.session_state[key]
@@ -431,7 +481,7 @@ def render_tab3():
         else:
             st.button("🗑️ 删除选中", disabled=True, use_container_width=True)
 
-    # ---- 批量编辑（已迁移到 tag_manager） ----
+    # ---- 批量编辑 ----
     with st.expander("🏷️ 分组与标记", expanded=False):
         render_batch_tag_editor(target_df, db_path)
 
@@ -480,7 +530,6 @@ def render_tab3():
                     cursor.execute(f"DELETE FROM visits WHERE id IN ({placeholders})", ids_to_delete)
                     deleted_count = cursor.rowcount
 
-                    # ---- 清理孤儿标签 ----
                     from aurum_core.database import clean_orphan_tags
                     clean_orphan_tags(conn)
 

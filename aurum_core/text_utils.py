@@ -271,14 +271,18 @@ def render_sensitive_warning(text: str, patient_name: str, session_key: str, but
     """
     显示敏感信息警告并处理“已手动处理”按钮。
     返回 True 表示已通过检测（无敏感信息或用户已忽略），返回 False 表示触发了警告并停止。
+    如果用户点击“已手动处理”，则存储一个标志，后续不再检测（除非文本内容改变）。
     """
     from aurum_core.text_utils import check_sensitive_info
+    # 初始化标志
     if session_key not in st.session_state:
         st.session_state[session_key] = False
-    has_sensitive = False
-    if not st.session_state[session_key]:
-        has_sensitive, fields = check_sensitive_info(text, patient_name)
-    if has_sensitive and not st.session_state[session_key]:
+    # 如果用户已经点击“已手动处理”，则直接返回 True（不再检测）
+    if st.session_state[session_key]:
+        return True
+    # 否则进行检测
+    has_sensitive, fields = check_sensitive_info(text, patient_name)
+    if has_sensitive:
         col_warn, col_btn = st.columns([4, 1.5])
         with col_warn:
             st.error(f"⛔ 检测到输入文本中包含患者的敏感信息（{', '.join(fields)}），请先脱敏！")
@@ -289,23 +293,74 @@ def render_sensitive_warning(text: str, patient_name: str, session_key: str, but
         st.stop()
         return False
     else:
-        st.session_state[session_key] = False
         return True
 
-# 在 aurum_core/text_utils.py 末尾添加
 def normalize_date_str(date_str: str) -> str:
     """
     将多种日期格式标准化为 YYYY-MM-DD
-    支持的格式：YYYY-MM-DD, YYYY.MM.DD, YYYY/MM/DD, YYYY年MM月DD日
+    支持：
+    - 带分隔符：YYYY-MM-DD, YYYY.MM.DD, YYYY/MM/DD
+    - 中文格式：YYYY年MM月DD日/号, YY年MM月DD日/号, YYYY年MM月
+    - 纯数字：YYYYMMDD, YYMMDD
     """
+    import re
     from datetime import datetime
+
     if not date_str:
         return date_str
-    date_str = date_str.strip()
-    for fmt in ('%Y-%m-%d', '%Y.%m.%d', '%Y/%m/%d', '%Y年%m月%d日', '%Y年%m月%d'):
+
+    s = date_str.strip()
+
+    # 1. 标准分隔符格式
+    for fmt in ('%Y-%m-%d', '%Y.%m.%d', '%Y/%m/%d'):
         try:
-            dt = datetime.strptime(date_str, fmt)
+            dt = datetime.strptime(s, fmt)
             return dt.strftime('%Y-%m-%d')
         except ValueError:
             continue
-    return date_str  # 如果无法解析，返回原字符串
+
+    # 2. 中文格式（用正则提取）
+    # 匹配 YYYY年MM月DD日/号 或 YY年MM月DD日/号
+    match = re.search(r'(\d{2,4})年(\d{1,2})月(\d{1,2})[日号]', s)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        if year < 100:
+            year += 2000
+        try:
+            dt = datetime(year, month, day)
+            return dt.strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+
+    # 3. 只有年月（默认1日）
+    match = re.search(r'(\d{4})年(\d{1,2})月', s)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        try:
+            dt = datetime(year, month, 1)
+            return dt.strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+
+    # 4. 纯数字
+    if s.isdigit():
+        if len(s) == 8:
+            try:
+                dt = datetime.strptime(s, '%Y%m%d')
+                return dt.strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+        elif len(s) == 6:
+            try:
+                year = 2000 + int(s[:2])
+                month = int(s[2:4])
+                day = int(s[4:6])
+                dt = datetime(year, month, day)
+                return dt.strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+
+    return date_str  # 无法解析则原样返回

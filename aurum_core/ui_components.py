@@ -59,16 +59,29 @@ def folder_opener(patient_name: str, visit_date: str, key_prefix: str = ""):
     if st.button("📂 打开文件夹", use_container_width=True, disabled=disabled, key=f"{key_prefix}_folder"):
         from aurum_core.database import get_docx_path
         import os
-        docx_path = get_docx_path(patient_name, visit_date)
-        if docx_path and os.path.exists(docx_path):
-            folder_path = os.path.dirname(docx_path)
+        # 先尝试从数据库获取 date_folder_path
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT date_folder_path, docx_path FROM visits WHERE patient_name = ? AND visit_date = ?",
+                       (patient_name, visit_date))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            date_folder_path, docx_path = row
+            if date_folder_path and os.path.exists(date_folder_path):
+                folder_path = date_folder_path
+            elif docx_path and os.path.exists(docx_path):
+                folder_path = os.path.dirname(docx_path)
+            else:
+                st.error("❌ 无法定位该就诊记录的文件夹")
+                return
             try:
-                open_folder(folder_path)  # 替换为跨平台函数
+                open_folder(folder_path)
                 st.toast(f"✅ 已打开文件夹：{folder_path}", icon="📁", duration=5)
             except Exception as e:
                 st.error(f"❌ 打开文件夹失败：{e}")
         else:
-            st.error("❌ 找不到该就诊记录的文件路径")
+            st.error("❌ 找不到该就诊记录")
 
 def edit_record_ui(patient_name: str = None, visit_date: str = None):
     db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "aurum_index.db")
@@ -131,7 +144,7 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
             return False, f"更新档案失败：{e}"
 
     # =========================================================
-    # 1. 编辑个人信息
+    # 1. 编辑个人信息（不变）
     # =========================================================
     if edit_type == "个人信息":
         cursor.execute(
@@ -189,11 +202,12 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
                 conn.close()
 
     # =========================================================
-    # 2. 编辑就诊信息（不含标记）
+    # 2. 编辑就诊信息（区分中医/西医诊断）
     # =========================================================
     else:
         cursor.execute(
-            "SELECT id, diagnosis, prescription, visit_remarks FROM visits WHERE patient_name = ? AND visit_date = ?",
+            "SELECT id, diagnosis, western_diagnosis, prescription, visit_remarks "
+            "FROM visits WHERE patient_name = ? AND visit_date = ?",
             (patient_name, visit_date)
         )
         row = cursor.fetchone()
@@ -201,7 +215,7 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
             st.error("未找到该就诊记录")
             conn.close()
             return
-        visit_id, current_diagnosis, current_prescription, current_visit_remarks = row
+        visit_id, current_diagnosis, current_western_diagnosis, current_prescription, current_visit_remarks = row
 
         def fmt(val):
             if not val:
@@ -215,11 +229,13 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
                 return str(val)
 
         display_diagnosis = fmt(current_diagnosis)
+        display_western_diagnosis = fmt(current_western_diagnosis)
         display_prescription = fmt(current_prescription)
 
         with st.form(key="edit_visit_form"):
             st.markdown(f"**编辑 {patient_name} 于 {visit_date} 的就诊信息**")
-            new_diagnosis = st.text_input("诊断（用顿号分隔）", value=display_diagnosis)
+            new_diagnosis = st.text_input("中医诊断（用顿号分隔）", value=display_diagnosis)
+            new_western_diagnosis = st.text_input("西医诊断（用顿号分隔）", value=display_western_diagnosis)
             new_prescription = st.text_input("方剂（用顿号分隔）", value=display_prescription)
             new_visit_remarks = st.text_area("就诊备注", value=current_visit_remarks, height=80)
 
@@ -236,11 +252,17 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
                     return json.dumps(items, ensure_ascii=False)
 
                 new_diag_json = to_json_list(new_diagnosis)
+                new_western_diag_json = to_json_list(new_western_diagnosis)
                 new_presc_json = to_json_list(new_prescription)
 
                 cursor.execute(
-                    "UPDATE visits SET diagnosis = ?, prescription = ?, visit_remarks = ? WHERE id = ?",
-                    (new_diag_json, new_presc_json, new_visit_remarks, visit_id)
+                    """UPDATE visits SET 
+                       diagnosis = ?, 
+                       western_diagnosis = ?, 
+                       prescription = ?, 
+                       visit_remarks = ? 
+                       WHERE id = ?""",
+                    (new_diag_json, new_western_diag_json, new_presc_json, new_visit_remarks, visit_id)
                 )
                 conn.commit()
 
@@ -264,6 +286,29 @@ def render_batch_tag_editor(target_df, db_path):
         return
 
     st.caption(f"已选中 {target_count} 条记录")
+
+    # 显示当前选中记录的标签汇总
+    if target_count > 0:
+        all_groups = []
+        all_marks = []
+        for _, row in target_df.iterrows():
+            groups = row.get('患者分组列表', [])
+            if isinstance(groups, list):
+                all_groups.extend(groups)
+            marks = row.get('就诊标记列表', [])
+            if isinstance(marks, list):
+                all_marks.extend(marks)
+        unique_groups = list(set(all_groups))
+        unique_marks = list(set(all_marks))
+        summary_parts = []
+        if unique_groups:
+            summary_parts.append(f"分组：{'、'.join(unique_groups)}")
+        if unique_marks:
+            summary_parts.append(f"标记：{'、'.join(unique_marks)}")
+        if summary_parts:
+            st.caption("当前选中记录的标签汇总：" + " | ".join(summary_parts))
+        else:
+            st.caption("当前选中记录暂无标签")
 
     batch_field = st.selectbox(
         "选择修改模式",

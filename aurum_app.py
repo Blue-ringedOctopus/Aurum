@@ -3,6 +3,8 @@ import yaml
 import bcrypt
 import os
 import platform
+import json
+from datetime import datetime
 
 from aurum_core.tab1 import render_tab1
 from aurum_core.tab2 import render_tab2
@@ -10,6 +12,7 @@ from aurum_core.tab3 import render_tab3
 from aurum_core.user_settings import get_user_setting, save_user_settings
 from aurum_core.database import init_database, upgrade_database
 from aurum_core.utils import open_folder
+from aurum_core.data_io import export_database, import_database
 
 # 当前版本号（每次发布新版本时手动更新）
 CURRENT_VERSION = "1.0.0"  # 请根据实际版本修改
@@ -54,20 +57,21 @@ def get_cert_path():
     except Exception:
         return None
 
-def check_for_updates(show_ignore: bool = True):
+def check_for_updates(show_ignore: bool = True, show_ui: bool = True, silent_if_up_to_date: bool = False):
     """
-    检查 GitHub 最新版本，显示提示，并提供“本次忽略”按钮和下载超链接（右侧布局）。
-    出错时显示明确的错误信息。
+    检查 GitHub 最新版本。
+    - show_ui: 是否显示 UI 信息（用于手动检查）
+    - silent_if_up_to_date: 如果版本最新，是否静默（不显示“已是最新”）
     """
     import platform
     import requests
     import urllib3
 
-    # macOS 特殊处理
     if platform.system() == 'Darwin':
-        st.info("📢 请前往 GitHub Releases 手动下载最新版本。")
-        st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
-        return
+        if show_ui:
+            st.info("📢 请前往 GitHub Releases 手动下载最新版本。")
+            st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
+        return None, None, None
 
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     api_url = "https://api.github.com/repos/Blue-ringedOctopus/Aurum/releases/latest"
@@ -77,42 +81,42 @@ def check_for_updates(show_ignore: bool = True):
         resp.raise_for_status()
         release = resp.json()
         latest_version = release.get("tag_name", "").lstrip('v')
-
         if not latest_version:
-            st.error("无法解析版本信息，请稍后重试或手动访问 GitHub Releases。")
-            return
+            if show_ui:
+                st.error("无法解析版本信息，请稍后重试或手动访问 GitHub Releases。")
+            return None, None, None
 
         if latest_version <= CURRENT_VERSION:
-            st.success(f"✅ 您已是最新版本 (v{CURRENT_VERSION})")
-            return
+            if show_ui and not silent_if_up_to_date:
+                st.success(f"✅ 您已是最新版本 (v{CURRENT_VERSION})")
+            return None, None, None
 
-        # ---------- 有新版本：显示信息 + 右侧操作 ----------
-        # 1. 显示信息
-        st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})，请手动下载更新。")
-
-        # 2. 右侧布局：忽略按钮（左） + 下载超链接（右），等宽靠右
-        #    使用两列，左侧留空，右侧两列等宽
-        col_left, col_right = st.columns([3, 2])  # 左侧占 3 份，右侧占 2 份（让右侧靠右）
-        with col_right:
-            col_ignore, col_download = st.columns(2)
-            with col_ignore:
-                if show_ignore:
-                    if st.button("⏭️ 本次忽略", use_container_width=True):
-                        st.session_state.ignored_version = latest_version
-                        st.rerun()
-            with col_download:
-                # 使用超链接（通过 st.markdown 渲染）
-                st.markdown(
-                    "[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)",
-                    unsafe_allow_html=True
-                )
-
-    except requests.exceptions.RequestException as e:
-        st.error(f"网络请求失败：{e}\n请检查网络连接后重试，或手动访问 GitHub Releases。")
-    except ValueError as e:
-        st.error(f"解析版本信息失败：{e}\n请稍后重试，或手动访问 GitHub Releases。")
+        # 有新版本
+        download_url = None
+        for asset in release.get('assets', []):
+            if asset['name'].endswith('.exe') or asset['name'].endswith('.dmg'):
+                download_url = asset['browser_download_url']
+                break
+        if show_ui:
+            st.info(f"📢 发现新版本 **{latest_version}** (当前版本 v{CURRENT_VERSION})，请手动下载更新。")
+            col_left, col_right = st.columns([3, 2])
+            with col_right:
+                col_ignore, col_download = st.columns(2)
+                with col_ignore:
+                    if show_ignore:
+                        if st.button("⏭️ 本次忽略", use_container_width=True):
+                            st.session_state.ignored_version = latest_version
+                            st.rerun()
+                with col_download:
+                    st.markdown(
+                        f"[🌐 前往下载]({download_url})",
+                        unsafe_allow_html=True
+                    )
+        return latest_version, download_url
     except Exception as e:
-        st.error(f"检查更新时发生未知错误：{e}\n请手动访问 GitHub Releases 查看最新版本。")
+        if show_ui:
+            st.error(f"检查更新失败：{e}")
+        return None, None, None
 
 def perform_update(download_url):
     """
@@ -458,7 +462,7 @@ else:
 
     # 启动时自动检查更新（仅一次）
     if 'checked_update' not in st.session_state:
-        check_for_updates(show_ignore=True)
+        check_for_updates(show_ignore=True, silent_if_up_to_date=True)
         st.session_state.checked_update = True
 
     tab1, tab2, tab3 = st.tabs(["📂 归档整理", "📊 数据库浏览", "🤖 智能体"])
@@ -545,9 +549,10 @@ else:
                 label_visibility="collapsed"
             )
 
-        # 数据存储位置
+        # ---- 数据管理（导入/导出） ----
         st.sidebar.divider()
-        st.sidebar.subheader("📁 数据存储位置")
+        st.sidebar.subheader("💾 数据管理")
+
         db_path = os.path.abspath("aurum_index.db")
         st.sidebar.write(f"**数据库文件**：`{db_path}`")
         if st.sidebar.button("📂 打开数据库所在文件夹", key="open_db_folder"):
@@ -555,13 +560,55 @@ else:
                 open_folder(db_path)
             except Exception as e:
                 st.sidebar.error(f"打开失败：{e}")
-        st.sidebar.caption("💡 请不要移动数据库文件，以免程序出错。")
+
+        # 导出
+        st.sidebar.write("**导出数据库**")
+        json_data = export_database()
+        try:
+            temp_data = json.loads(json_data)
+            if not temp_data.get("visits") and not temp_data.get("patient_profiles"):
+                st.sidebar.warning("数据库为空，没有数据可导出。")
+            else:
+                st.sidebar.download_button(
+                    label="📥 下载 JSON 备份",
+                    data=json_data,
+                    file_name=f"aurum_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key="export_db"
+                )
+        except Exception as e:
+            st.sidebar.error(f"导出数据异常：{e}")
+
+        # 导入
+        st.sidebar.write("**导入数据库**")
+        uploaded_file = st.sidebar.file_uploader("", type="json", key="import_uploader", label_visibility="collapsed")
+        if uploaded_file is not None:
+            mode = st.sidebar.radio("导入模式", ["覆盖", "追加"], horizontal=True, key="import_mode")
+            if st.sidebar.button("执行导入", use_container_width=True):
+                json_str = uploaded_file.read().decode('utf-8')
+                try:
+                    temp_data = json.loads(json_str)
+                    if not temp_data or (not temp_data.get("visits") and not temp_data.get("patient_profiles")):
+                        st.sidebar.error("所选文件为空，请检查文件内容。")
+                    else:
+                        if mode == "覆盖":
+                            success, msg = import_database(json_str, mode="overwrite")
+                        else:
+                            success, msg = import_database(json_str, mode="append")
+                        if success:
+                            st.session_state.pending_toast = "数据库导入成功！"
+                            st.rerun()
+                        else:
+                            st.sidebar.error(f"导入失败：{msg}")
+                except json.JSONDecodeError:
+                    st.sidebar.error("所选文件不是有效的 JSON 格式，请检查文件内容。")
 
         # ---- 版本号 + 联系方式 ----
         st.sidebar.divider()
         # 在侧边栏合适位置（比如在设置区域后面）
         if st.sidebar.button("🔍 检查更新", use_container_width=True):
-            check_for_updates(show_ignore=False)
+            check_for_updates(show_ignore=False, silent_if_up_to_date=False)
         st.sidebar.caption(f"版本 v{CURRENT_VERSION}")
         st.sidebar.caption("联系我们：aurumdeveloper@yeah.net")
 

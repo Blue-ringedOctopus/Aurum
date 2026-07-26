@@ -166,8 +166,8 @@ def update_patient_profile(patient_name: str, info: dict, first_visit_date: str)
 
 # ==================== 核心函数 ====================
 def update_all_profiles():
-    """供归档调用的入口：遍历所有患者，提取初诊信息并更新档案"""
-    print("🔄 开始更新所有患者档案...")
+    """供归档调用的入口：遍历所有患者，提取所有就诊记录并合并信息（补空不覆盖）。"""
+    print("🔄 开始更新所有患者档案（合并模式）...")
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT patient_name FROM visits")
@@ -177,64 +177,102 @@ def update_all_profiles():
         return
 
     for patient in patients:
+        # 获取该患者所有就诊记录（按日期升序）
         cursor.execute(
-            "SELECT visit_date, docx_path FROM visits WHERE patient_name = ? ORDER BY visit_date ASC LIMIT 1",
+            "SELECT visit_date, docx_path FROM visits WHERE patient_name = ? ORDER BY visit_date ASC",
             (patient,)
         )
-        result = cursor.fetchone()
-        if not result:
-            continue
-        visit_date, docx_path = result
-
-        print(f"🔍 处理患者：{patient}，初诊文件：{docx_path}")
-
-        if not os.path.exists(docx_path):
-            print(f"⚠️ {patient} 初诊文件缺失，跳过")
+        rows = cursor.fetchall()
+        if not rows:
             continue
 
-        text = read_file_content(docx_path)
-        if not text:
-            print(f"⚠️ {patient} 初诊文件无法读取或内容为空，跳过")
-            continue
+        merged_info = {
+            'gender': None,
+            'birth_date': None,
+            'phone': None,
+            'id_card': None,
+            'address': None
+        }
+        age = None
+        first_visit_date = None
 
-        info, age = extract_patient_info(text)
-        print(
-            f"📝 提取结果：性别={info.get('gender')}, 出生日期={info.get('birth_date')}, 电话={info.get('phone')}, 年龄={age}")
+        for visit_date, docx_path in rows:
+            if not docx_path:
+                continue
+            if not os.path.exists(docx_path):
+                print(f"⚠️ {patient} 文件缺失：{docx_path}，跳过")
+                continue
+            text = read_file_content(docx_path)
+            if not text:
+                continue
 
-        # ---- 优先：直接提取的出生日期 ----
-        if info.get('birth_date'):
-            # 已有，无需处理
-            pass
-        # ---- 其次：从身份证号提取 ----
-        elif info.get('id_card'):
-            id_birth = extract_birth_from_id(info['id_card'])
-            if id_birth:
-                info['birth_date'] = id_birth
-                print(f"   ℹ️ {patient} 从身份证号提取出生日期：{id_birth}")
-        # ---- 再次：根据年龄和就诊日期反推 ----
-        if not info.get('birth_date') and age:
-            visit_date_normalized = normalize_date_str(visit_date)
+            info, age_from_this = extract_patient_info(text)
+            # 合并信息：只填补空字段
+            for key in merged_info:
+                if merged_info[key] is None and info.get(key):
+                    merged_info[key] = info.get(key)
+            if age is None and age_from_this is not None:
+                age = age_from_this
+            if first_visit_date is None:
+                first_visit_date = visit_date
+
+            # 如果所有字段都已填满，可以提前跳出（但年龄和首诊日期可能还需要）
+            # 我们保留继续遍历，但若所有个人信息已齐，可考虑 break（可选）
+            # 为保持简单，不 break，确保首诊日期为最早日期（已在循环外得到）
+
+        # ---- 补全出生日期（如果仍为空且年龄存在） ----
+        if merged_info['birth_date'] is None and age and first_visit_date:
+            visit_date_normalized = normalize_date_str(first_visit_date)
             birth_year = None
             if visit_date_normalized:
                 try:
                     visit_dt = datetime.strptime(visit_date_normalized, '%Y-%m-%d')
                     birth_year = visit_dt.year - age
                 except ValueError:
-                    print("日期解析失败")
+                    print(f"日期解析失败：{first_visit_date}")
             if birth_year is not None:
                 current_year = datetime.now().year
                 if 1900 <= birth_year <= current_year + 1:
-                    info['birth_date'] = f"{birth_year}-01-01"
+                    merged_info['birth_date'] = f"{birth_year}-01-01"
                     print(f"   ℹ️ {patient} 根据年龄 {age} 推算出出生年份 {birth_year}")
-                else:
-                    print(f"   ⚠️ {patient} 推算的出生年份 {birth_year} 不合理，跳过")
-            else:
-                print(f"   ⚠️ {patient} 就诊日期 {visit_date} 解析失败，无法推算出生日期")
 
-        # 即使只有部分信息也更新（可能只有性别或电话）
-        update_patient_profile(patient, info, visit_date)
-        print(f"✅ {patient} 档案已更新（性别:{info.get('gender')}, 出生:{info.get('birth_date')}, 电话:{info.get('phone')}）")
+        # ---- 更新数据库 ----
+        # 检查是否存在记录
+        cursor.execute("SELECT 1 FROM patient_profiles WHERE patient_name = ?", (patient,))
+        exists = cursor.fetchone()
+        if exists:
+            # 更新（仅当有变化）
+            update_fields = []
+            update_values = []
+            for key in merged_info:
+                if merged_info[key] is not None:
+                    update_fields.append(f"{key} = ?")
+                    update_values.append(merged_info[key])
+            if first_visit_date:
+                update_fields.append("first_visit_date = ?")
+                update_values.append(first_visit_date)
+            if update_fields:
+                update_values.append(patient)
+                query = f"UPDATE patient_profiles SET {', '.join(update_fields)} WHERE patient_name = ?"
+                cursor.execute(query, update_values)
+                print(f"✅ {patient} 档案已更新（合并后信息）")
+        else:
+            # 插入
+            cursor.execute(
+                """INSERT INTO patient_profiles 
+                   (patient_name, gender, birth_date, phone, id_card, address, first_visit_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (patient,
+                 merged_info.get('gender'),
+                 merged_info.get('birth_date'),
+                 merged_info.get('phone'),
+                 merged_info.get('id_card'),
+                 merged_info.get('address'),
+                 first_visit_date)
+            )
+            print(f"✅ {patient} 档案已创建（合并后信息）")
 
+    conn.commit()
     print("✅ 所有患者档案更新完成。")
 
 # ==================== 独立运行入口 ====================

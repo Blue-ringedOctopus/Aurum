@@ -2,9 +2,14 @@
 import os
 import sqlite3
 import shutil
+import json
 from aurum_core.database import get_db_path
 from aurum_core.text_utils import read_file_content, normalize_date_str, extract_diagnosis
 import re
+DATE_PATTERN = re.compile(
+    r'^(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}[日号]|'
+    r'\d{8}|\d{6}|\d{2}年\d{1,2}月\d{1,2}[日号])(?:\s*)(.*)$'
+)
 
 def clean_patient_name(name: str) -> str:
     """
@@ -88,7 +93,7 @@ def select_medical_file(folder_path: str, expected_date: str = None) -> tuple:
     if expected_date:
         patterns = [
             r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})',
-            r'(\d{4})年(\d{1,2})月(\d{1,2})日?',
+            r'(\d{4})年(\d{1,2})月(\d{1,2})[日号]?',  # 允许 日/号/无
             r'(\d{4})年(\d{1,2})月',
         ]
         for pat in patterns:
@@ -231,6 +236,46 @@ def _insert_visit_record(cursor, patient: str, visit_date: str, hospital: str, d
     except Exception:
         return False
 
+def _insert_empty_visit_record(cursor, patient: str, visit_date: str, hospital: str, date_folder_path: str) -> bool:
+    """
+    向 visits 表插入一条空记录（无 docx_path，无 full_medical_text）。
+    用于患者文件夹存在但无文档文件的情况。
+    返回 True 表示插入成功（或已存在），False 表示失败。
+    """
+    try:
+        cursor.execute(
+            "SELECT id FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
+            (patient, visit_date, hospital)
+        )
+        if cursor.fetchone():
+            return True  # 已存在，视为成功
+        cursor.execute(
+            "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, NULL, NULL, ?)",
+            (patient, visit_date, hospital, date_folder_path)
+        )
+        return True
+    except Exception:
+        return False
+
+def is_archived_structure(root_path: str) -> bool:
+    """
+    检测根目录下是否存在至少一个路径满足：深度 ≥ 2（相对于根目录），
+    且该目录名匹配日期模式。
+    返回 True 表示是已归档结构，False 表示未整理。
+    """
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        rel_path = os.path.relpath(dirpath, root_path)
+        if rel_path == '.':
+            depth = 0
+        else:
+            depth = len(rel_path.split(os.sep))
+        # 深度 ≥ 2 意味着至少是 医院/患者 或 医院/日期/患者 等
+        if depth >= 2:
+            current_dir = os.path.basename(dirpath)
+            if DATE_PATTERN.match(current_dir):
+                return True
+    return False
+
 def reorganize_files(src, tgt, aggregate: bool = False):
     # --- 第一步：检查源目录 ---
     if not os.path.exists(src):
@@ -243,14 +288,9 @@ def reorganize_files(src, tgt, aggregate: bool = False):
     except PermissionError:
         return "⛔ 没有权限读取源文件夹"
 
-    # ---- 日期格式匹配 ----
-    date_pattern = re.compile(
-        r'^(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日?)(?:\s+(.*))?$'
-    )
-
     # ---- 先检测根目录类型（不创建目标目录） ----
     base_name = os.path.basename(src)
-    match_root = date_pattern.match(base_name)
+    match_root = DATE_PATTERN.match(base_name)
     log_lines = []
 
     if match_root and os.path.isdir(src):
@@ -263,7 +303,7 @@ def reorganize_files(src, tgt, aggregate: bool = False):
         date_folders = []
         for f in items:
             full_path = os.path.join(src, f)
-            if os.path.isdir(full_path) and date_pattern.match(f):
+            if os.path.isdir(full_path) and DATE_PATTERN.match(f):
                 date_folders.append(f)
         if date_folders:
             root_is_date = False
@@ -273,7 +313,7 @@ def reorganize_files(src, tgt, aggregate: bool = False):
             hospital_candidates = [f for f in items if os.path.isdir(os.path.join(src, f))]
             if hospital_candidates:
                 return (
-                    "❌ 检测到您输入的是已整理好的归档文件夹（医院→患者→日期），请使用的「🔄 刷新数据库」折叠面板"
+                    "❌ 检测到您输入的是已整理好的归档文件夹（医院/患者/日期），请使用的「🔄 刷新数据库」"
                 )
             else:
                 return "⚠️ 归档失败：根目录下既没有日期文件夹，也没有可识别的医院文件夹。请确认源目录是否正确。"
@@ -281,7 +321,7 @@ def reorganize_files(src, tgt, aggregate: bool = False):
     # ========== 以下为结构A（日期文件夹，需要复制） ==========
     # ---- 检查源目录与目标目录是否相同（仅结构A需要） ----
     if os.path.abspath(src) == os.path.abspath(tgt):
-        return "⚠️ 源目录与目标目录相同，请修改目标目录为不同路径，否则可能导致文件混乱。"
+        return "⚠️ 源目录与目标目录相同，请修改目标目录为不同路径。"
 
     # ---- 创建目标目录（结构A专用） ----
     try:
@@ -316,7 +356,7 @@ def reorganize_files(src, tgt, aggregate: bool = False):
         else:
             date_path = os.path.join(src, date_folder)
 
-        m = date_pattern.match(date_folder)
+        m = DATE_PATTERN.match(date_folder)
         if not m:
             log_lines.append(f"   ⚠️ 跳过无法解析的日期文件夹：{date_folder}")
             continue
@@ -358,7 +398,14 @@ def reorganize_files(src, tgt, aggregate: bool = False):
                 file_count += len(files)
 
             if file_count == 0:
-                log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）文件夹为空，跳过")
+                # 创建目标目录（空文件夹）
+                os.makedirs(patient_tgt_path, exist_ok=True)
+                # 插入空记录
+                if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
+                    log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）文件夹为空，已创建空记录")
+                    total_patients += 1
+                else:
+                    log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败")
                 continue
 
             shutil.copytree(patient_src_path, patient_tgt_path, dirs_exist_ok=True)
@@ -378,7 +425,13 @@ def reorganize_files(src, tgt, aggregate: bool = False):
                 else:
                     log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件无效或为空，已跳过")
             else:
-                log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）未找到病历文件（.docx/.doc/.txt），已跳过")
+                # 无文档文件 → 创建空记录
+                if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
+                    log_lines.append(
+                        f"   ⚠️ {patient}（{pure_date}，{hospital_name}）未找到病历文件")
+                    total_patients += 1  # 虽然无文档，但仍计入已处理患者
+                else:
+                    log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败，请检查数据库")
 
     conn.commit()
 
@@ -387,7 +440,6 @@ def reorganize_files(src, tgt, aggregate: bool = False):
         try:
             from aurum_core.extract_patient_profiles import update_all_profiles
             update_all_profiles()
-            log_lines.append("   ✅ 患者个人信息已提取（性别/出生日期/电话等）")
         except Exception as e:
             log_lines.append(f"   ⚠️ 自动提取个人信息失败：{e}")
 
@@ -415,10 +467,6 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
     if not os.path.exists(hospital_path):
         return f"❌ 医院路径不存在：{hospital_path}"
 
-    date_pattern = re.compile(
-        r'^(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日?)(?:\s+(.*))?$'
-    )
-
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -435,14 +483,14 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
     if not subdirs:
         return f"⚠️ 医院 [{hospital_name}] 下没有子目录"
 
-    date_folders = [f for f in subdirs if date_pattern.match(f)]
+    date_folders = [f for f in subdirs if DATE_PATTERN.match(f)]
 
     # ========== 结构A：医院/日期/患者（复制模式） ==========
     if date_folders:
         log_lines.append(f"🏥 处理科室：{hospital_name}（日期→患者结构，【复制模式】）")
         for date_folder in date_folders:
             date_path = os.path.join(hospital_path, date_folder)
-            m = date_pattern.match(date_folder)
+            m = DATE_PATTERN.match(date_folder)
             if not m:
                 continue
             raw_date = m.group(1)
@@ -457,8 +505,14 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
                 # 检查是否为空文件夹
                 file_count = sum(len(files) for _, _, files in os.walk(patient_src_path))
                 if file_count == 0:
-                    log_lines.append(f"   ⚠️ {patient}（{pure_date}）文件夹为空，跳过")
-                    total_skipped += 1
+                    os.makedirs(patient_tgt_path, exist_ok=True)
+                    if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
+                        log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）文件夹为空，已创建空记录")
+                        total_success += 1
+                        updated_patients.append(patient)
+                    else:
+                        log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败")
+                        total_failed += 1
                     continue
 
                 # 复制整个文件夹
@@ -486,8 +540,15 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
                         log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件无效或为空，已跳过")
                         total_failed += 1
                 else:
-                    log_lines.append(f"   ⚠️ {patient}（{pure_date}）未找到病历文件，已跳过")
-                    total_failed += 1
+                    # 无文档文件 → 创建空记录
+                    if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
+                        log_lines.append(
+                            f"   ⚠️ {patient}（{pure_date}，{hospital_name}）未找到病历文件")
+                        total_success += 1  # 视为成功（至少记录了患者信息）
+                        updated_patients.append(patient)  # 后续仍会生成档案
+                    else:
+                        log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败，请检查数据库")
+                        total_failed += 1
 
         conn.commit()
         conn.close()
@@ -497,7 +558,6 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
             try:
                 from aurum_core.extract_patient_profiles import update_all_profiles
                 update_all_profiles()
-                log_lines.append("   ✅ 患者个人信息已提取（性别/出生日期/电话等）")
             except Exception as e:
                 log_lines.append(f"   ⚠️ 自动提取个人信息失败：{e}")
 
@@ -505,7 +565,6 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
             for patient in set(updated_patients):
                 try:
                     update_patient_archive_by_db(patient, aggregate=False)
-                    log_lines.append(f"   ✅ {patient} 的档案已生成/更新")
                 except Exception as e:
                     log_lines.append(f"   ⚠️ 生成档案失败（{patient}）：{e}")
 
@@ -520,19 +579,19 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
             patient_path = os.path.join(hospital_path, patient_raw)
             # 获取该患者下的所有日期子文件夹
             date_subdirs = [f for f in os.listdir(patient_path)
-                            if os.path.isdir(os.path.join(patient_path, f)) and date_pattern.match(f)]
+                            if os.path.isdir(os.path.join(patient_path, f)) and DATE_PATTERN.match(f)]
             if not date_subdirs:
                 log_lines.append(f"   ⚠️ {patient} 文件夹下没有日期子文件夹，跳过")
                 total_skipped += 1
                 continue
 
             for date_folder in date_subdirs:
-                m = date_pattern.match(date_folder)
+                m = DATE_PATTERN.match(date_folder)
                 if not m:
                     continue
                 raw_date = m.group(1)
                 pure_date = normalize_date_str(raw_date)
-                patient_date_path = os.path.join(patient_path, date_folder)
+                patient_date_path = os.path.join(patient_path, date_folder)  # 日期文件夹路径
 
                 # 检查是否为空
                 file_count = sum(len(files) for _, _, files in os.walk(patient_date_path))
@@ -557,12 +616,18 @@ def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name:
                         log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件无效或为空，已跳过")
                         total_failed += 1
                 else:
-                    log_lines.append(f"   ⚠️ {patient}（{pure_date}）未找到病历文件，已跳过")
-                    total_failed += 1
+                    # 插入空记录
+                    if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_date_path):
+                        log_lines.append(f"   ℹ️ {patient}（{pure_date}）未找到病历文件，已创建空记录")
+                        total_success += 1
+                    else:
+                        log_lines.append(f"   ❌ {patient}（{pure_date}）创建空记录失败")
+                        total_failed += 1
 
         conn.commit()
         conn.close()
-        log_lines.append(f"📊 {hospital_name}：成功更新 {total_success} 条记录，失败 {total_failed} 条，跳过 {total_skipped} 个空文件夹")
+        log_lines.append(
+            f"📊 {hospital_name}：成功更新 {total_success} 条记录，失败 {total_failed} 条，跳过 {total_skipped} 个空文件夹")
         log_lines.append("✅ 处理完成：未在目标目录创建任何文件或文件夹，仅数据库已同步。")
         return "\n".join(log_lines)
 
@@ -789,20 +854,10 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
         return "⛔ 没有权限读取源文件夹"
 
     # ---- 检测是否为结构A（日期文件夹） ----
-    date_pattern = re.compile(
-        r'^(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日?)(?:\s+(.*))?$'
-    )
-    base_name = os.path.basename(src_root)
-    if date_pattern.match(base_name):
+    # ---- 检测是否为已归档结构（医院/患者/日期） ----
+    if not is_archived_structure(src_root):
         return (
-            "❌ 检测到日期文件夹（未整理病历），请使用主界面的「归档整理」功能进行复制归档。\n"
-            "   刷新数据库仅适用于已整理好的归档文件夹（医院/患者/日期）。"
-        )
-    date_subdirs = [f for f in items if os.path.isdir(os.path.join(src_root, f)) and date_pattern.match(f)]
-    hospital_candidates = [f for f in items if os.path.isdir(os.path.join(src_root, f)) and not date_pattern.match(f)]
-    if date_subdirs and not hospital_candidates:
-        return (
-            "❌ 检测到日期文件夹集合（未整理病历），请使用主界面的「归档整理」功能进行复制归档。\n"
+            "❌ 检测到未整理病历（日期/患者），请使用主界面的「归档整理」功能进行复制归档。\n"
             "   刷新数据库仅适用于已整理好的归档文件夹（医院/患者/日期）。"
         )
 
@@ -820,25 +875,27 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
     total_skipped_no_file = 0
     total_skipped_empty = 0
     total_skipped_occupied = 0
+    total_skipped_date_parse = 0
 
     # ---- 直接扫描三层结构：医院/患者/日期 ----
     for hospital in os.listdir(src_root):
         hospital_path = os.path.join(src_root, hospital)
         if not os.path.isdir(hospital_path):
             continue
-        log_lines.append(f"🏥 处理医院：{hospital}")
         for patient in os.listdir(hospital_path):
             patient_path = os.path.join(hospital_path, patient)
             if not os.path.isdir(patient_path):
                 continue
-            log_lines.append(f"   👤 患者：{patient}")
             for date_folder in os.listdir(patient_path):
                 date_path = os.path.join(patient_path, date_folder)
                 if not os.path.isdir(date_path):
                     continue
                 pure_date = normalize_date_str(date_folder)
                 if not pure_date:
-                    log_lines.append(f"      ⚠️ 日期格式无法解析：{date_folder}，跳过")
+                    log_lines.append(
+                        f"   ⚠️ 患者 {patient} | {date_folder} ：日期格式无法解析，跳过"
+                    )
+                    total_skipped_date_parse += 1
                     total_errors += 1
                     continue
 
@@ -850,25 +907,49 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
                         docx_file = f_path
                         break
                 if not docx_file:
-                    log_lines.append(f"      ⚠️ {date_folder} 未找到文档文件，跳过")
-                    total_skipped_no_file += 1
+                    cursor.execute(
+                        "SELECT id, date_folder_path FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
+                        (patient, pure_date, hospital))
+                    row = cursor.fetchone()
+                    if row:
+                        # 已有记录，检查 date_folder_path 是否需要更新
+                        existing_id, current_path = row
+                        if current_path != date_path:
+                            cursor.execute("UPDATE visits SET date_folder_path = ? WHERE id = ?",
+                                           (date_path, existing_id))
+                            log_lines.append(f"   ℹ️ 更新空记录路径：患者 {patient} | {pure_date} | 医院 {hospital}")
+                    else:
+                        # 插入空记录
+                        cursor.execute(
+                            "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, NULL, NULL, ?)",
+                            (patient, pure_date, hospital, date_path)
+                        )
+                        total_inserted += 1
+                        log_lines.append(
+                            f"   ℹ️ 患者 {patient} | {pure_date} | 医院 {hospital} ：无文档文件，已创建空记录")
                     continue
 
                 # 读取文件内容，区分具体错误
                 try:
                     content = read_file_content(docx_file)
                 except (PermissionError, OSError):
-                    log_lines.append(f"      ⚠️ 文件被占用（可能正在编辑）：{docx_file}，跳过")
+                    log_lines.append(
+                        f"   ⚠️ 患者 {patient} | {pure_date} ：文件被占用（{docx_file}），跳过"
+                    )
                     total_skipped_occupied += 1
                     total_errors += 1
                     continue
                 except Exception as e:
-                    log_lines.append(f"      ❌ 读取文件失败：{docx_file}，错误：{e}")
+                    log_lines.append(
+                        f"   ❌ 患者 {patient} | {pure_date} ：读取文件失败（{docx_file}），错误：{e}"
+                    )
                     total_errors += 1
                     continue
 
                 if not content or not content.strip():
-                    log_lines.append(f"      ⚠️ 文件内容为空：{docx_file}，跳过")
+                    log_lines.append(
+                        f"   ⚠️ 患者 {patient} | {pure_date} ：文件内容为空，跳过"
+                    )
                     total_skipped_empty += 1
                     total_errors += 1
                     continue
@@ -881,18 +962,16 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
                 existing = cursor.fetchone()
                 if existing:
                     cursor.execute(
-                        "UPDATE visits SET docx_path = ?, full_medical_text = ? WHERE id = ?",
+                        "UPDATE visits SET docx_path = ?, full_medical_text = ?, date_folder_path = NULL WHERE id = ?",
                         (docx_file, content, existing[0])
                     )
                     total_updated += 1
-                    log_lines.append(f"      ✅ 更新记录：{patient} | {pure_date} | {hospital}")
                 else:
                     cursor.execute(
                         "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text) VALUES (?, ?, ?, ?, ?)",
                         (patient, pure_date, hospital, docx_file, content)
                     )
                     total_inserted += 1
-                    log_lines.append(f"      ✅ 新增记录：{patient} | {pure_date} | {hospital}")
 
                 # 提取诊断
                 tcm_list, wm_list = extract_diagnosis(content, default_to_tcm=True)
@@ -912,19 +991,26 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
 
     # ---- 统计摘要 ----
     log_lines.append("")
-    log_lines.append(f"📊 刷新统计：")
-    log_lines.append(f"   - 更新记录数：{total_updated}")
-    log_lines.append(f"   - 新增记录数：{total_inserted}")
-    log_lines.append(f"   - 跳过（无文档）：{total_skipped_no_file}")
-    log_lines.append(f"   - 跳过（内容为空）：{total_skipped_empty}")
-    log_lines.append(f"   - 跳过（文件被占用）：{total_skipped_occupied}")
-    log_lines.append(f"   - 总错误数：{total_errors}")
+    log_lines.append("📊 刷新统计：")
+    log_lines.append(f"   ✅ 更新记录数：{total_updated}")
+    log_lines.append(f"   ✅ 新增记录数：{total_inserted}")
+    if total_skipped_no_file > 0:
+        log_lines.append(f"   ⏭️ 跳过（无病历文件）：{total_skipped_no_file}")
+    if total_skipped_empty > 0:
+        log_lines.append(f"   ⏭️ 跳过（内容为空）：{total_skipped_empty}")
+    if total_skipped_occupied > 0:
+        log_lines.append(f"   ⏭️ 跳过（文件被占用）：{total_skipped_occupied}")
+    if total_skipped_date_parse > 0:
+        log_lines.append(f"   ⏭️ 跳过（日期格式无法解析）：{total_skipped_date_parse}")
+    if total_errors > 0:
+        log_lines.append(f"   ❌ 总错误数：{total_errors}")
+    else:
+        log_lines.append("   🎉 无错误，全部成功！")
 
     # ---- 提取个人信息 ----
     try:
         from aurum_core.extract_patient_profiles import update_all_profiles
         update_all_profiles()
-        log_lines.append("✅ 患者个人信息已提取（性别/出生日期/电话等）")
     except Exception as e:
         log_lines.append(f"⚠️ 自动提取个人信息失败：{e}")
 
@@ -946,5 +1032,5 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
     except Exception as e:
         log_lines.append(f"⚠️ 更新档案文件失败：{e}")
 
-    log_lines.append(f"✅ 刷新完成：更新 {total_updated} 条，新增 {total_inserted} 条，错误 {total_errors} 条。")
+    log_lines.append("✅ 刷新完成。")
     return "\n".join(log_lines)

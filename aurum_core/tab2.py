@@ -17,10 +17,10 @@ from aurum_core.database import (
     get_patient_profile,
     get_all_visits_for_patient,
     get_all_patient_folders,
-    check_existing_diagnosis
+    check_existing_diagnosis,
+    get_db_path
 )
 from aurum_core.utils import open_folder
-
 
 def render_tab2():
     # ---- 初始化 API 密钥管理折叠状态 ----
@@ -160,7 +160,11 @@ def render_tab2():
         if st.button("📥 自动脱敏导入", use_container_width=True, disabled=auto_disabled, key="diag_auto"):
             import traceback
             docx_path = get_docx_path(patient_name_input_diag, selected_visit_date_diag)
-            if docx_path and os.path.exists(docx_path):
+            if docx_path is None:
+                st.warning("⚠️ 该就诊记录暂无关联的病历文件，请手动补充文件后刷新数据库。")
+            elif not os.path.exists(docx_path):
+                st.error("❌ 关联的病历文件已被删除或移动，请检查路径。")
+            else:
                 try:
                     from aurum_core.deidentifier import extract_safe_content
                     profile = get_patient_profile(patient_name_input_diag)
@@ -176,8 +180,6 @@ def render_tab2():
                     error_msg = f"❌ 自动脱敏失败：{e}\n{traceback.format_exc()}"
                     st.error(error_msg)
                     print(error_msg)
-            else:
-                st.error("❌ 找不到该就诊记录的原始文件")
 
         folder_opener(patient_name_input_diag, selected_visit_date_diag, key_prefix="diag")
 
@@ -209,18 +211,63 @@ def render_tab2():
     # ---- 检查是否已有诊断（独立成行） ----
     if 'force_diagnosis' not in st.session_state:
         st.session_state.force_diagnosis = False
-
-    has_diag, has_presc, diag_display, presc_display = check_existing_diagnosis(
-        patient_name_input_diag, selected_visit_date_diag
+    db_path = get_db_path()
+    # 根据模式检测对应列
+    diag_col = "diagnosis" if diag_mode == "中医诊断" else "western_diagnosis"
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT {diag_col} FROM visits WHERE patient_name = ? AND visit_date = ?",
+        (patient_name_input_diag, selected_visit_date_diag)
     )
-    if has_diag and not st.session_state.force_diagnosis:
+    row = cursor.fetchone()
+    conn.close()
+    existing_diag = row[0] if row and row[0] else None
+    has_diag = bool(existing_diag and existing_diag != "[]")
+    diag_display = None
+    if has_diag:
+        try:
+            diag_list = json.loads(existing_diag)
+            if isinstance(diag_list, list) and diag_list:
+                diag_display = '、'.join(diag_list)
+            else:
+                diag_display = existing_diag
+        except:
+            diag_display = existing_diag
+
+    # 检查是否有本次会话新生成的诊断结果
+    has_new_result = (
+            'diagnosis_result' in st.session_state and
+            st.session_state.get('diag_patient') == patient_name_input_diag and
+            st.session_state.get('diag_date') == selected_visit_date_diag
+    )
+
+    if has_diag and not st.session_state.force_diagnosis and not has_new_result:
         col_warn, col_btn = st.columns([4, 1.5])
         with col_warn:
-            st.warning(f"⚠️ 该就诊记录已存在诊断：{diag_display}")
+            st.warning(f"⚠️ 该就诊记录已存在{diag_mode}：{diag_display}")
         with col_btn:
             if st.button("🔄 仍要重新识别", key="force_diagnosis_btn", use_container_width=True):
-                st.session_state.force_diagnosis = True
-                st.rerun()
+                current_text = st.session_state.get('diag_input', '')
+                if not st.session_state.get('api_key'):
+                    st.error("❌ 请先保存 API 密钥")
+                elif not current_text.strip():
+                    st.error("❌ 请输入病历内容")
+                elif not valid_patient_diag or not valid_date_diag:
+                    st.error("❌ 请选择有效的患者和就诊日期")
+                else:
+                    with st.spinner("⏳ 正在重新识别诊断..."):
+                        result = identify_diagnosis(
+                            current_text,
+                            api_key=st.session_state.api_key,
+                            model="deepseek-v4-pro",
+                            mode=diag_mode
+                        )
+                        st.session_state['diagnosis_result'] = result
+                        st.session_state['diag_patient'] = patient_name_input_diag
+                        st.session_state['diag_date'] = selected_visit_date_diag
+                        st.session_state.force_diagnosis = False
+                        st.rerun()
         st.stop()
     else:
         st.session_state.force_diagnosis = False
@@ -237,8 +284,6 @@ def render_tab2():
             elif not valid_patient_diag or not valid_date_diag:
                 st.error("❌ 请选择有效的患者和就诊日期")
             else:
-                # ---- 检查是否已有诊断（已在外部检测，这里不再重复） ----
-                # ---- 敏感信息检测已在外部完成 ----
                 with st.spinner("⏳ 正在识别诊断..."):
                     result = identify_diagnosis(
                         current_text,
@@ -256,9 +301,7 @@ def render_tab2():
             save_disabled = not (valid_patient_diag and valid_date_diag)
             if st.button("💾 保存诊断到数据库", use_container_width=True, disabled=save_disabled):
                 try:
-                    from aurum_core.llm_tools import parse_llm_response
                     import re
-
                     patient_to_save = st.session_state['diag_patient']
                     date_to_save = st.session_state['diag_date']
 
@@ -266,19 +309,22 @@ def render_tab2():
                     _, conclusion = parse_llm_response(st.session_state['diagnosis_result'])
                     if not conclusion:
                         conclusion = st.session_state['diagnosis_result']
+                    # 清洗“【最终结论】”前缀（无论是否在开头，去除所有出现）
+                    if '【最终结论】' in conclusion:
+                        conclusion = conclusion.split('【最终结论】')[-1].strip()
 
                     # ---- 将结论拆分成独立的标签 ----
-                    # 支持分隔符：中文顿号、中文逗号、英文逗号、中文分号、英文分号、空格
                     items = re.split(r'[，,、；;]\s*', conclusion)
                     items = [item.strip() for item in items if item.strip()]
 
-                    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "aurum_index.db")
+                    db_path = get_db_path()
                     conn = sqlite3.connect(db_path)
                     cursor = conn.cursor()
 
                     # ---- 读取已有诊断 ----
+                    col_name = "diagnosis" if diag_mode == "中医诊断" else "western_diagnosis"
                     cursor.execute(
-                        "SELECT diagnosis FROM visits WHERE patient_name = ? AND visit_date = ?",
+                        f"SELECT {col_name} FROM visits WHERE patient_name = ? AND visit_date = ?",
                         (patient_to_save, date_to_save)
                     )
                     row = cursor.fetchone()
@@ -298,7 +344,7 @@ def render_tab2():
 
                     updated = json.dumps(existing, ensure_ascii=False)
                     cursor.execute(
-                        "UPDATE visits SET diagnosis = ? WHERE patient_name = ? AND visit_date = ?",
+                        f"UPDATE visits SET {col_name} = ? WHERE patient_name = ? AND visit_date = ?",
                         (updated, patient_to_save, date_to_save)
                     )
                     conn.commit()
@@ -353,7 +399,11 @@ def render_tab2():
         if st.button("📥 自动脱敏导入", use_container_width=True, disabled=auto_extract_disabled,
                      key="auto_prescription"):
             docx_path = get_docx_path(patient_name_input, selected_visit_date)
-            if docx_path and os.path.exists(docx_path):
+            if docx_path is None:
+                st.warning("⚠️ 该就诊记录暂无关联的病历文件，请手动补充文件后刷新数据库。")
+            elif not os.path.exists(docx_path):
+                st.error("❌ 关联的病历文件已被删除或移动，请检查路径。")
+            else:
                 try:
                     from aurum_core.text_utils import read_file_content
                     text = read_file_content(docx_path)
@@ -368,8 +418,6 @@ def render_tab2():
                         st.error("❌ 无法读取病历文件，请检查文件是否存在。")
                 except Exception as e:
                     st.error(f"❌ 自动提取失败：{e}")
-            else:
-                st.error("❌ 找不到该就诊记录的原始文件。")
 
         folder_opener(patient_name_input, selected_visit_date, key_prefix="prescription")
 
@@ -402,14 +450,38 @@ def render_tab2():
     has_diag, has_presc, diag_display, presc_display = check_existing_diagnosis(
         patient_name_input, selected_visit_date
     )
-    if has_presc and not st.session_state.get('force_prescription', False):
+
+    # 检查是否有本次会话新生成的方剂结果
+    has_new_presc_result = (
+            'prescription_result' in st.session_state and
+            st.session_state.get('prescription_patient') == patient_name_input and
+            st.session_state.get('prescription_date') == selected_visit_date
+    )
+
+    if has_presc and not st.session_state.get('force_prescription', False) and not has_new_presc_result:
         col_warn, col_btn = st.columns([4, 1.5])
         with col_warn:
             st.warning(f"⚠️ 该就诊记录已存在方剂：{presc_display}")
         with col_btn:
             if st.button("🔄 仍要重新识别", key="force_prescription_btn", use_container_width=True):
-                st.session_state.force_prescription = True
-                st.rerun()
+                if not st.session_state.get('api_key'):
+                    st.error("❌ 请先保存 API 密钥")
+                elif not prescription_text.strip():
+                    st.error("❌ 请输入药方内容")
+                elif not valid_patient or not valid_date:
+                    st.error("❌ 请选择有效的患者和就诊日期")
+                else:
+                    with st.spinner("⏳ 正在重新识别方剂..."):
+                        result = identify_prescription(
+                            prescription_text,
+                            api_key=st.session_state.api_key,
+                            model="deepseek-v4-pro"
+                        )
+                        st.session_state['prescription_result'] = result
+                        st.session_state['prescription_patient'] = patient_name_input
+                        st.session_state['prescription_date'] = selected_visit_date
+                        st.session_state.force_prescription = False
+                        st.rerun()
         st.stop()
     else:
         st.session_state.force_prescription = False
@@ -432,6 +504,8 @@ def render_tab2():
                         model="deepseek-v4-pro"
                     )
                     st.session_state['prescription_result'] = result
+                    st.session_state['prescription_patient'] = patient_name_input  # 新增
+                    st.session_state['prescription_date'] = selected_visit_date  # 新增
                     st.session_state.force_prescription = False
                     st.rerun()
 
@@ -440,16 +514,25 @@ def render_tab2():
             save_disabled = not (valid_patient and valid_date)
             if st.button("💾 保存方剂到数据库", use_container_width=True, disabled=save_disabled):
                 try:
+                    import re
+                    # ---- 提取方剂名称 ----
                     name_match = re.search(r'【方剂名称】\s*(.+?)(?=\n|$)', st.session_state['prescription_result'])
                     if name_match:
                         conclusion = name_match.group(1).strip()
                     else:
                         # 如果无法解析，使用全文作为后备
                         conclusion = st.session_state['prescription_result']
+                    # 清洗“【方剂名称】”前缀（无论是否在开头，去除所有出现）
+                    if '【方剂名称】' in conclusion:
+                        conclusion = conclusion.split('【方剂名称】')[-1].strip()
 
                     # ---- 将结论拆分成独立的标签（方剂可能多个，用顿号分隔） ----
                     items = re.split(r'[，,、；;]\s*', conclusion)
                     items = [item.strip() for item in items if item.strip()]
+
+                    db_path = get_db_path()
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
 
                     # ---- 读取已有方剂 ----
                     cursor.execute(
@@ -613,9 +696,37 @@ def render_tab2():
                 f"⚠️ 该患者已有 {len(existing_commentary_files)} 个按语文件（{os.path.basename(existing_commentary_files[0])}）"
             )
         with col_btn:
+            # ---- 改为直接执行生成，而不是仅设置状态 ----
             if st.button("🔄 仍要重新生成", key="force_overwrite_comm_btn", use_container_width=True):
-                st.session_state.force_overwrite_commentary = True
-                st.rerun()
+                if not st.session_state.get('api_key'):
+                    st.error("❌ 请先保存 API 密钥")
+                elif not valid_patient_comm:
+                    st.error("❌ 请选择有效的患者")
+                elif not st.session_state.get('comm_input', '').strip():
+                    st.error("❌ 请先导入或输入合并后的病历内容")
+                else:
+                    with st.status("⏳ 正在重新生成按语...", expanded=True) as status:
+                        status.update(label="📤 已发送请求至大模型，正在生成按语...")
+                        from aurum_core.llm_tools import generate_commentary
+                        try:
+                            result = generate_commentary(
+                                st.session_state['comm_input'],
+                                api_key=st.session_state.api_key,
+                                model="deepseek-v4-pro",
+                                timeout=120,
+                                style=style_map[style_option]
+                            )
+                            if result:
+                                status.update(label="✅ 按语重新生成完成！", state="complete")
+                                st.session_state['commentary_result'] = result
+                                st.session_state.force_overwrite_commentary = False
+                                st.rerun()
+                            else:
+                                status.update(label="❌ 生成失败，请重试", state="error")
+                                st.error("大模型返回空结果，请检查API密钥或网络。")
+                        except Exception as e:
+                            status.update(label="❌ 请求异常", state="error")
+                            st.error(f"生成按语失败：{e}")
         st.stop()
     else:
         st.session_state.force_overwrite_commentary = False

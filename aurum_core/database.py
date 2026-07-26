@@ -81,6 +81,10 @@ def init_database(db_path="aurum_index.db"):
                 FOREIGN KEY (tag_id) REFERENCES visit_mark_tags(id) ON DELETE CASCADE
             )
         ''')
+        cursor.execute("PRAGMA table_info(visits)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'date_folder_path' not in columns:
+            cursor.execute("ALTER TABLE visits ADD COLUMN date_folder_path TEXT")
         conn.commit()
 
 def upgrade_database(db_path="aurum_index.db"):
@@ -150,6 +154,13 @@ def upgrade_database(db_path="aurum_index.db"):
             # 考虑到你已删除旧数据，最简单的方法是删除表重建
             # 但为了安全，我们只做增量添加
             pass
+
+        # ---- 新增 date_folder_path 列（用于空记录） ----
+        cursor.execute("PRAGMA table_info(visits)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'date_folder_path' not in columns:
+            cursor.execute("ALTER TABLE visits ADD COLUMN date_folder_path TEXT")
+            print("✅ 已添加列：date_folder_path")
 
         conn.commit()
 
@@ -346,24 +357,36 @@ def get_patient_folder(patient_name: str, db_path="aurum_index.db") -> str:
         return None
 
 def get_all_patient_folders(patient_name: str, db_path="aurum_index.db") -> list:
-    """获取某患者在所有医院下的文件夹路径列表"""
     import os
     import sqlite3
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        # 获取该患者所有就诊记录的 docx_path
-        cursor.execute("SELECT docx_path FROM visits WHERE patient_name = ?", (patient_name,))
+        # 同时查询 docx_path 和 date_folder_path
+        cursor.execute(
+            "SELECT docx_path, date_folder_path FROM visits WHERE patient_name = ?",
+            (patient_name,)
+        )
         rows = cursor.fetchall()
-
         folders = []
         seen = set()
-        for row in rows:
-            if row[0]:
-                # docx_path 格式：医院/患者/日期/病历.docx，向上两级得到医院/患者/
-                folder = os.path.dirname(os.path.dirname(row[0]))
-                if folder not in seen:
-                    folders.append(folder)
-                    seen.add(folder)
+        for docx_path, date_folder_path in rows:
+            folder = None
+            # 优先使用 date_folder_path
+            if date_folder_path:
+                # date_folder_path 存储的是日期文件夹路径，需要向上两层到达患者文件夹
+                # 但为了兼容性，我们检查它是否已经是患者文件夹层级
+                # 通常 date_folder_path 是 .../医院/患者/日期，我们需要 .../医院/患者
+                patient_folder = os.path.dirname(date_folder_path)
+                if os.path.exists(patient_folder):
+                    folder = patient_folder
+                else:
+                    # 如果不存在（可能用户移动了根目录），回退到推断逻辑
+                    folder = date_folder_path
+            elif docx_path:
+                folder = os.path.dirname(os.path.dirname(docx_path))
+            if folder and folder not in seen:
+                folders.append(folder)
+                seen.add(folder)
         return folders
 
 def check_file_validity(db_path="aurum_index.db") -> dict:
@@ -409,7 +432,8 @@ def load_all_visits_with_tags(db_path: str) -> pd.DataFrame:
         v.prescription AS 方剂,
         v.full_medical_text AS 病历,
         v.visit_remarks AS 就诊备注,
-        v.docx_path AS 文件路径
+        v.docx_path AS 文件路径,
+        v.date_folder_path AS 日期文件夹路径
     FROM visits v
     LEFT JOIN patient_profiles p ON v.patient_name = p.patient_name
     ORDER BY v.patient_name, v.visit_date

@@ -45,19 +45,28 @@ def collect_folders_to_delete(records: List[Tuple[str, str]], db_path: str) -> T
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     for patient_name, visit_date in records:
-        cursor.execute(
-            "SELECT docx_path FROM visits WHERE patient_name = ? AND visit_date = ?",
-            (patient_name, visit_date)
-        )
+        cursor.execute("SELECT docx_path, date_folder_path FROM visits WHERE patient_name = ? AND visit_date = ?",
+                       (patient_name, visit_date))
         row = cursor.fetchone()
-        if row and row[0]:
-            docx_path = row[0]
-            date_folder = os.path.dirname(docx_path)                      # .../医院/患者/日期
-            patient_folder = os.path.dirname(date_folder)                 # .../医院/患者
-            hospital_folder = os.path.dirname(patient_folder)             # .../医院
-            date_folders.add(date_folder)
-            patient_folders.add(patient_folder)
-            hospital_folders.add(hospital_folder)
+        if row:
+            docx_path, date_folder_path = row
+            # 优先使用 date_folder_path
+            if date_folder_path and os.path.exists(date_folder_path):
+                folder = date_folder_path
+                date_folders.add(folder)
+                # 继续向上推断患者文件夹和医院文件夹
+                patient_folder = os.path.dirname(folder)
+                hospital_folder = os.path.dirname(patient_folder)
+                patient_folders.add(patient_folder)
+                hospital_folders.add(hospital_folder)
+            elif docx_path:
+                date_folder = os.path.dirname(docx_path)
+                patient_folder = os.path.dirname(date_folder)
+                hospital_folder = os.path.dirname(patient_folder)
+                date_folders.add(date_folder)
+                patient_folders.add(patient_folder)
+                hospital_folders.add(hospital_folder)
+            # 如果两者都为空，则该记录无法定位文件夹，跳过
     conn.close()
     return date_folders, patient_folders, hospital_folders
 
