@@ -15,7 +15,7 @@ from aurum_core.utils import open_folder
 from aurum_core.data_io import export_database, import_database
 
 # 当前版本号（每次发布新版本时手动更新）
-CURRENT_VERSION = "1.0.0"  # 请根据实际版本修改
+CURRENT_VERSION = "1.0.1"  # 请根据实际版本修改
 
 # 你的 GitHub 用户名和仓库名
 GITHUB_REPO = "Blue-ringedOctopus/Aurum"  # 替换为你的用户名和仓库名
