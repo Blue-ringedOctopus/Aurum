@@ -431,22 +431,7 @@ def render_tab3():
                 st.button("📂 文件路径无效", disabled=True, use_container_width=True)
         else:
             st.button("📂 打开文件夹", disabled=True, use_container_width=True)
-
-    with col_download:
-        import io
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            display_page_df[display_cols_with_tags].to_excel(writer, index=False, sheet_name='数据')
-        excel_data = output.getvalue()
-        st.download_button(
-            label="📥 下载 Excel",
-            data=excel_data,
-            file_name="filtered_data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="download_filtered_excel"
-        )
-
+    
     with col_delete:
         if target_count > 0:
             if st.button("🗑️ 删除选中", type="secondary", use_container_width=True):
