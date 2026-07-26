@@ -432,6 +432,40 @@ def render_tab3():
         else:
             st.button("📂 打开文件夹", disabled=True, use_container_width=True)
     
+    with col_download:
+        import io
+        import re
+
+        # 清洗非法字符的函数
+        def clean_for_excel(val):
+            if isinstance(val, str):
+                # 移除控制字符（除了换行符、制表符等常见允许的）
+                # 保留 \n, \t, \r，但移除其他不可打印控制字符
+                # 使用正则移除 ASCII 控制字符（0x00-0x1F）除了 \t (0x09), \n (0x0A), \r (0x0D)
+                cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', val)
+                # 移除零宽空格等特殊 Unicode 控制字符
+                cleaned = re.sub(r'[\u200B-\u200D\uFEFF]', '', cleaned)
+                return cleaned
+            return val
+
+        # 对要导出的 DataFrame 的所有列应用清洗
+        df_to_export = display_page_df[display_cols_with_tags].copy()
+        for col in df_to_export.columns:
+            df_to_export[col] = df_to_export[col].apply(clean_for_excel)
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_to_export.to_excel(writer, index=False, sheet_name='数据')
+        excel_data = output.getvalue()
+        st.download_button(
+            label="📥 下载 Excel",
+            data=excel_data,
+            file_name="filtered_data.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="download_filtered_excel"
+        )
+
     with col_delete:
         if target_count > 0:
             if st.button("🗑️ 删除选中", type="secondary", use_container_width=True):
