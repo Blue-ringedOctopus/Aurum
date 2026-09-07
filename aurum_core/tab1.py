@@ -122,6 +122,7 @@ def render_tab1():
             elif not os.path.exists(refresh_root):
                 st.error("❌ 路径不存在，请检查")
             else:
+                from aurum_core.user_settings import get_user_setting
                 aggregate = get_user_setting('aggregate_visits', False)
                 with st.spinner("⏳ 正在刷新数据库..."):
                     result_log = refresh_index_only(refresh_root, aggregate=aggregate)
