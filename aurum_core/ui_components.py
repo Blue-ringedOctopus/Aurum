@@ -5,8 +5,7 @@ import sqlite3
 import os
 import json
 import streamlit as st
-import pandas as pd
-from aurum_core.utils import open_folder
+from aurum_core.user_settings import get_user_setting
 
 def patient_selector(key_prefix: str = "") -> tuple:
     """
@@ -51,40 +50,80 @@ def visit_date_selector(patient_name: str, key_prefix: str = "") -> tuple:
 # aurum_core/ui_components.py（追加）
 
 def folder_opener(patient_name: str, visit_date: str, key_prefix: str = ""):
-    """
-    渲染“打开文件夹”按钮，点击后打开该就诊记录的文件夹。
-    如果未选择有效患者和日期，按钮禁用。
-    """
+    """渲染“打开文件夹”按钮，适配两种目录结构"""
+    import os
+    import sqlite3
+    from aurum_core.utils import open_folder
+
     disabled = not (patient_name and visit_date)
     if st.button("📂 打开文件夹", use_container_width=True, disabled=disabled, key=f"{key_prefix}_folder"):
-        from aurum_core.database import get_docx_path
-        import os
-        # 先尝试从数据库获取 date_folder_path
+        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "aurum_index.db")
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT date_folder_path, docx_path FROM visits WHERE patient_name = ? AND visit_date = ?",
-                       (patient_name, visit_date))
+        cursor.execute(
+            "SELECT date_folder_path, docx_path FROM visits WHERE patient_name = ? AND visit_date = ?",
+            (patient_name, visit_date)
+        )
         row = cursor.fetchone()
         conn.close()
+
         if row:
             date_folder_path, docx_path = row
+            folder_path = None
+            enable_hospital_layer = get_user_setting('enable_hospital_layer', True)
+
+            # 尝试从 date_folder_path 推断
             if date_folder_path and os.path.exists(date_folder_path):
-                folder_path = date_folder_path
+                if enable_hospital_layer:
+                    folder_path = os.path.dirname(date_folder_path)      # .../医院/患者
+                else:
+                    folder_path = os.path.dirname(date_folder_path)      # .../患者
             elif docx_path and os.path.exists(docx_path):
-                folder_path = os.path.dirname(docx_path)
+                if enable_hospital_layer:
+                    folder_path = os.path.dirname(os.path.dirname(docx_path))  # .../医院/患者
+                else:
+                    folder_path = os.path.dirname(docx_path)                  # .../患者
+
+            # 备选：如果按当前设置找不到，尝试用另一种结构
+            if not folder_path or not os.path.exists(folder_path):
+                if docx_path and os.path.exists(docx_path):
+                    try:
+                        if enable_hospital_layer:
+                            # 当前有医院层但找不到，试试无医院层
+                            alt_path = os.path.dirname(docx_path)
+                        else:
+                            # 当前无医院层但找不到，试试有医院层
+                            alt_path = os.path.dirname(os.path.dirname(docx_path))
+                        if os.path.exists(alt_path):
+                            folder_path = alt_path
+                    except:
+                        pass
+
+            if folder_path and os.path.exists(folder_path):
+                try:
+                    open_folder(folder_path)
+                    st.toast(f"✅ 已打开文件夹：{folder_path}", icon="📁", duration=5)
+                except Exception as e:
+                    st.error(f"❌ 打开文件夹失败：{e}")
             else:
                 st.error("❌ 无法定位该就诊记录的文件夹")
-                return
-            try:
-                open_folder(folder_path)
-                st.toast(f"✅ 已打开文件夹：{folder_path}", icon="📁", duration=5)
-            except Exception as e:
-                st.error(f"❌ 打开文件夹失败：{e}")
         else:
             st.error("❌ 找不到该就诊记录")
 
 def edit_record_ui(patient_name: str = None, visit_date: str = None):
     db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "aurum_index.db")
+
+    # ---- 如果传入的 patient_name 为空，尝试从 session_state 恢复 ----
+    if patient_name is None or visit_date is None:
+        patient_name = st.session_state.get('_edit_selected_patient', patient_name)
+        visit_date = st.session_state.get('_edit_selected_date', visit_date)
+
+        # 如果还是空，则清空 session_state 中的残留值
+        if patient_name is None:
+            if '_edit_selected_patient' in st.session_state:
+                del st.session_state._edit_selected_patient
+            if '_edit_selected_date' in st.session_state:
+                del st.session_state._edit_selected_date
 
     # ---- 如果未传入患者姓名，则让用户选择 ----
     if not patient_name:
@@ -137,14 +176,14 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
     def update_archive(patient):
         try:
             from aurum_core.file_processor import update_patient_archive_by_db
-            aggregate = st.session_state.get('aggregate_visits', False)
+            aggregate = get_user_setting('aggregate_visits', False)
             update_patient_archive_by_db(patient, aggregate)
             return True, "档案文件已更新"
         except Exception as e:
             return False, f"更新档案失败：{e}"
 
     # =========================================================
-    # 1. 编辑个人信息（不变）
+    # 1. 编辑个人信息（包含重命名功能）
     # =========================================================
     if edit_type == "个人信息":
         cursor.execute(
@@ -158,18 +197,114 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
         else:
             current_gender, current_birth, current_phone, current_id_card, current_address, current_personal_remarks = profile
 
-        with st.form(key="edit_personal_form"):
-            st.markdown(f"**编辑 {patient_name} 的个人信息**")
+        # ---- 顶部：患者姓名 + 重命名按钮（独立于表单） ----
+        col_name, col_btn = st.columns([3, 1])
+        with col_name:
+            new_patient_name = st.text_input(
+                "患者姓名",
+                value=patient_name,
+                key="edit_patient_name_input",
+                placeholder="输入新姓名"
+            )
+        with col_btn:
+            st.write("")
+            st.write("")
+            rename_clicked = st.button(
+                "💾 重命名",
+                type = "primary",
+                use_container_width=True,
+                key="rename_patient_btn"
+            )
+            # ---- 实时校验：检测非法字符 ----
+            if new_patient_name.strip():
+                from aurum_core.file_processor import clean_patient_name
+                cleaned = clean_patient_name(new_patient_name)
+                if cleaned != new_patient_name:
+                    st.warning(f"⚠️ 姓名包含非法字符或格式不规范，将自动修正为「{cleaned}」")
+
+        # ---- 处理重命名点击（设置待确认状态） ----
+        if rename_clicked:
+            new_name = new_patient_name.strip()
+            if not new_name:
+                st.error("❌ 请输入新姓名")
+            elif new_name == patient_name:
+                st.warning("⚠️ 新姓名与旧姓名相同，无需修改")
+            else:
+                # 检测新姓名是否已存在（仅警告，不阻止）
+                conn_check = sqlite3.connect(db_path)
+                cursor_check = conn_check.cursor()
+                cursor_check.execute(
+                    "SELECT patient_name FROM patient_profiles WHERE patient_name = ?",
+                    (new_name,)
+                )
+                existing_patient = cursor_check.fetchone()
+                conn_check.close()
+
+                # 设置待确认状态
+                st.session_state.rename_pending = {
+                    "old_name": patient_name,
+                    "new_name": new_name,
+                    "has_conflict": existing_patient is not None
+                }
+                st.rerun()
+
+        # ---- 检查是否有待确认的重命名 ----
+        if st.session_state.get("rename_pending"):
+            pending = st.session_state.rename_pending
+            old_name = pending["old_name"]
+            new_name = pending["new_name"]
+            has_conflict = pending["has_conflict"]
+
+            conflict_warning = ""
+            if has_conflict:
+                conflict_warning = (
+                    f"\n\n⚠️ **警告：数据库中已存在同名患者「{new_name}」！**"
+                    f"\n将「{old_name}」重命名为「{new_name}」会导致两位患者的就诊记录、标签等数据合并，**无法恢复**。"
+                    f"\n请确认这是你想要的操作。"
+                )
+
+            confirm_msg = (
+                f"⚠️ **确认重命名患者**\n\n"
+                f"你即将把患者「**{old_name}**」重命名为「**{new_name}**」。\n\n"
+                f"此操作将更新数据库中所有关联记录，但**不会自动重命名文件系统中的患者文件夹**。"
+                f"{conflict_warning}\n\n"
+                f"确认执行吗？"
+            )
+
+            st.warning(confirm_msg)
+            col_confirm, col_cancel = st.columns(2)
+            with col_confirm:
+                if st.button("✅ 确认重命名", type="primary", use_container_width=True, key="confirm_rename"):
+                    with st.spinner("⏳ 正在重命名..."):
+                        from aurum_core.database import rename_patient
+                        success, msg, folders = rename_patient(old_name, new_name, db_path)
+                        if success:
+                            # 清除待确认状态
+                            del st.session_state.rename_pending
+                            st.session_state.pending_toast = f"✅ 患者已从「{old_name}」重命名为「{new_name}」"
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                            # 不清除状态，让用户可以选择取消或重新尝试
+            with col_cancel:
+                if st.button("❌ 取消", use_container_width=True, key="cancel_rename"):
+                    del st.session_state.rename_pending
+                    st.rerun()
+
+        # ---- 下方：个人信息表单（不含姓名） ----
+        with st.form(key="edit_personal_form", clear_on_submit=False):
             new_gender = st.text_input("性别", value=current_gender)
             new_birth = st.text_input("出生日期", value=current_birth)
             new_phone = st.text_input("电话", value=current_phone)
             new_id_card = st.text_input("身份证号", value=current_id_card)
             new_address = st.text_input("家庭住址", value=current_address)
             new_personal_remarks = st.text_area("个人信息备注", value=current_personal_remarks, height=80)
-            col_btn1, col_btn2 = st.columns([3, 1])
-            with col_btn2:
+
+            col_submit_left, col_submit_right = st.columns([3, 1])
+            with col_submit_right:
                 submitted = st.form_submit_button("💾 更新个人信息", type="primary", use_container_width=True)
 
+        # ---- 处理普通表单提交（更新其他字段） ----
         if submitted:
             try:
                 cursor.execute("SELECT 1 FROM patient_profiles WHERE patient_name = ?", (patient_name,))
@@ -189,11 +324,16 @@ def edit_record_ui(patient_name: str = None, visit_date: str = None):
                         (patient_name, new_gender, new_birth, new_phone, new_id_card, new_address, new_personal_remarks)
                     )
                 conn.commit()
-                success, msg = update_archive(patient_name)
-                if success:
-                    st.session_state.pending_toast = f"个人信息已更新，{msg}"
-                else:
-                    st.session_state.pending_warning = f"⚠️ 个人信息已更新，但{msg}"
+
+                try:
+                    from aurum_core.file_processor import update_patient_archive_by_db
+                    aggregate = get_user_setting('aggregate_visits', False)
+                    update_patient_archive_by_db(patient_name, aggregate)
+                    archive_msg = "档案文件已同步更新"
+                except Exception as e:
+                    archive_msg = f"档案文件更新失败：{e}"
+
+                st.session_state.pending_toast = f"个人信息已更新，{archive_msg}"
                 st.rerun()
             except Exception as e:
                 conn.rollback()

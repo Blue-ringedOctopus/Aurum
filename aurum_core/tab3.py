@@ -1,14 +1,15 @@
 import streamlit as st
 import os
 import json
-import sqlite3
 import pandas as pd
 from aurum_core.ui_components import edit_record_ui, render_batch_tag_editor
 from aurum_core.delete_handler import delete_records_clean
 from aurum_core.database import load_all_visits_with_tags
 from aurum_core.utils import open_folder
+from aurum_core.user_settings import get_user_setting
 
 def render_tab3():
+
     import sqlite3
     # ---- 显示挂起的消息（跨 rerun 持久） ----
     if 'pending_toast' in st.session_state and st.session_state.pending_toast:
@@ -266,15 +267,18 @@ def render_tab3():
             return ""
         return '、'.join(tag_list)
 
-    display_page_df = page_df.copy().fillna('')
+    enable_hospital_layer = st.session_state.get('enable_hospital_layer', True)
     display_cols_with_tags = [
         '患者姓名', '性别', '出生日期', '电话', '身份证号', '住址', '个人信息备注',
-        '就诊日期', '医院/科室', '中医诊断', '西医诊断', '方剂', '病历', '就诊备注'
+        '就诊日期'
     ]
+    if enable_hospital_layer:
+        display_cols_with_tags.append('医院/科室')
+    display_cols_with_tags.extend(['中医诊断', '西医诊断', '方剂', '病历', '就诊备注'])
 
     # ---- 表格 ----
     selection = st.dataframe(
-        display_page_df[display_cols_with_tags],
+        page_df[display_cols_with_tags],
         use_container_width=True,
         hide_index=True,
         selection_mode="multi-row",
@@ -343,7 +347,10 @@ def render_tab3():
                 if selected_records:
                     df_selected = pd.DataFrame(selected_records)
                     display_cols = ['患者姓名', '性别', '出生日期', '电话', '身份证号', '住址', '个人信息备注',
-                                    '就诊日期', '医院/科室', '中医诊断','西医诊断', '方剂', '病历', '就诊备注']
+                                    '就诊日期']
+                    if enable_hospital_layer:
+                        display_cols.append('医院/科室')
+                    display_cols.extend(['中医诊断', '西医诊断', '方剂', '病历', '就诊备注'])
                     st.dataframe(df_selected[display_cols], use_container_width=True, hide_index=True)
                 else:
                     st.info("选中的记录在当前筛选条件下未找到")
@@ -431,7 +438,7 @@ def render_tab3():
                 st.button("📂 文件路径无效", disabled=True, use_container_width=True)
         else:
             st.button("📂 打开文件夹", disabled=True, use_container_width=True)
-    
+
     with col_download:
         import io
         import re
@@ -449,7 +456,7 @@ def render_tab3():
             return val
 
         # 对要导出的 DataFrame 的所有列应用清洗
-        df_to_export = display_page_df[display_cols_with_tags].copy()
+        df_to_export = page_df[display_cols_with_tags].copy()
         for col in df_to_export.columns:
             df_to_export[col] = df_to_export[col].apply(clean_for_excel)
 
@@ -474,7 +481,7 @@ def render_tab3():
                     result = delete_records_clean(
                         deleted_records_info=deleted_records,
                         db_path=db_path,
-                        sync_enabled=st.session_state.get('sync_delete_enabled', False)
+                        sync_enabled=get_user_setting('sync_delete_enabled', False)
                     )
                 if result['success']:
                     if result['deleted_folders'] > 0 or result.get('_deleted_hospitals'):
@@ -508,10 +515,37 @@ def render_tab3():
     with st.expander("✏️ 编辑就诊记录"):
         selected_patient = None
         selected_visit_date = None
+
         if has_single_selection:
             row = page_df.iloc[selected_indices[0]]
             selected_patient = row['患者姓名']
             selected_visit_date = row['就诊日期']
+            # 保存到 session_state，供 rerun 后恢复
+            st.session_state._edit_selected_patient = selected_patient
+            st.session_state._edit_selected_date = selected_visit_date
+        else:
+            # 尝试从 session_state 恢复（用于重命名等操作后的 rerun）
+            selected_patient = st.session_state.get('_edit_selected_patient')
+            selected_visit_date = st.session_state.get('_edit_selected_date')
+
+            # 如果 session_state 中有值，但当前没有选中，仍可使用（但需要确保该记录还存在）
+            if selected_patient and selected_visit_date:
+                # 验证该记录是否仍存在于当前显示数据中（可选）
+                # 如果不存在，可以清空或提示
+                match = display_df[
+                    (display_df['患者姓名'] == selected_patient) &
+                    (display_df['就诊日期'] == selected_visit_date)
+                    ]
+                if match.empty:
+                    selected_patient = None
+                    selected_visit_date = None
+                    # 清空 session_state 中的旧值
+                    if '_edit_selected_patient' in st.session_state:
+                        del st.session_state._edit_selected_patient
+                    if '_edit_selected_date' in st.session_state:
+                        del st.session_state._edit_selected_date
+
+        # 调用编辑组件
         edit_record_ui(
             patient_name=selected_patient,
             visit_date=selected_visit_date

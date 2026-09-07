@@ -2,20 +2,24 @@ import streamlit as st
 import yaml
 import bcrypt
 import os
-import platform
 import json
 from datetime import datetime
 
 from aurum_core.tab1 import render_tab1
 from aurum_core.tab2 import render_tab2
 from aurum_core.tab3 import render_tab3
-from aurum_core.user_settings import get_user_setting, save_user_settings
+from aurum_core.user_settings import (
+    get_user_setting,
+    save_user_settings,
+    load_config,
+    save_config,
+)
 from aurum_core.database import init_database, upgrade_database
 from aurum_core.utils import open_folder
 from aurum_core.data_io import export_database, import_database
 
 # 当前版本号（每次发布新版本时手动更新）
-CURRENT_VERSION = "1.0.1"  # 请根据实际版本修改
+CURRENT_VERSION = "1.0.2"  # 请根据实际版本修改
 
 # 你的 GitHub 用户名和仓库名
 GITHUB_REPO = "Blue-ringedOctopus/Aurum"  # 替换为你的用户名和仓库名
@@ -117,147 +121,6 @@ def check_for_updates(show_ignore: bool = True, show_ui: bool = True, silent_if_
         if show_ui:
             st.error(f"检查更新失败：{e}")
         return None, None, None
-
-def perform_update(download_url):
-    """
-    下载新版本的 .zip 压缩包，解压并覆盖旧文件（保留 config.yaml 和 aurum_index.db）。
-    增加详细的状态反馈。
-    """
-    import os
-    import sys
-    import tempfile
-    import zipfile
-    import shutil
-    import subprocess
-    import time
-    import requests
-    import webbrowser
-    import urllib3
-
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    try:
-        # 开始提示
-        st.toast("🚀 开始更新...", icon="⬇️")
-
-        PROXY_LIST = [
-            "https://ghproxy.com/",
-            "https://ghproxy.net/",
-            "https://gitproxy.click/",
-        ]
-        urls_to_try = [download_url] + [proxy + download_url for proxy in PROXY_LIST]
-
-        temp_zip = os.path.join(tempfile.gettempdir(), "Aurum_update.zip")
-        downloaded = False
-
-        # 下载
-        with st.spinner("正在下载更新包..."):
-            for url in urls_to_try:
-                try:
-                    response = requests.get(url, stream=True, timeout=30, verify=False)
-                    if response.status_code == 200:
-                        total_size = int(response.headers.get('content-length', 0))
-                        progress_bar = st.progress(0, text="下载进度")
-                        downloaded_bytes = 0
-                        with open(temp_zip, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                                downloaded_bytes += len(chunk)
-                                if total_size > 0:
-                                    progress_bar.progress(min(downloaded_bytes / total_size, 1.0))
-                        progress_bar.empty()
-                        downloaded = True
-                        break
-                except Exception:
-                    continue
-
-        if not downloaded:
-            st.error("下载失败，请检查网络或前往 GitHub Releases 手动下载。")
-            st.markdown("[🌐 前往下载](https://github.com/Blue-ringedOctopus/Aurum/releases/latest)")
-            return
-
-        st.success("下载完成，正在解压...")
-
-        # 解压
-        extract_dir = tempfile.mkdtemp()
-        with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
-
-        # 获取当前程序所在目录
-        if getattr(sys, 'frozen', False):
-            current_dir = os.path.dirname(sys.executable)
-        else:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-
-        st.info("正在替换文件（保留您的配置和数据库）...")
-
-        # 复制文件
-        for root, dirs, files in os.walk(extract_dir):
-            rel_path = os.path.relpath(root, extract_dir)
-            if rel_path == '.':
-                target_dir = current_dir
-            else:
-                target_dir = os.path.join(current_dir, rel_path)
-                os.makedirs(target_dir, exist_ok=True)
-
-            for file in files:
-                if file in ['config.yaml', 'aurum_index.db']:
-                    continue
-                src_file = os.path.join(root, file)
-                dst_file = os.path.join(target_dir, file)
-                try:
-                    shutil.copy2(src_file, dst_file)
-                except Exception as e:
-                    st.warning(f"⚠️ 无法复制 {file}：{e}")
-
-        # 清理临时文件
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        os.remove(temp_zip)
-
-        # 显示成功并延迟退出
-        st.success("🎉 更新完成！程序将自动重启。")
-        time.sleep(3)
-
-        # 重启程序
-        if getattr(sys, 'frozen', False):
-            subprocess.Popen([sys.executable])
-        else:
-            subprocess.Popen([sys.executable, __file__])
-        sys.exit(0)
-
-    except Exception as e:
-        st.error(f"❌ 更新失败：{e}")
-        # 清理临时文件
-        try:
-            if os.path.exists(temp_zip):
-                os.remove(temp_zip)
-            if os.path.exists(extract_dir):
-                shutil.rmtree(extract_dir, ignore_errors=True)
-        except:
-            pass
-
-def ensure_config_structure(config: dict) -> dict:
-    """确保 config 中的 credentials 和 user_settings 始终为字典，且不为 None"""
-    if 'credentials' not in config or config['credentials'] is None:
-        config['credentials'] = {'usernames': {}}
-    if 'usernames' not in config['credentials'] or config['credentials']['usernames'] is None:
-        config['credentials']['usernames'] = {}
-
-    if 'user_settings' not in config or config['user_settings'] is None:
-        config['user_settings'] = {}
-    return config
-
-
-def load_config():
-    with open('config.yaml', 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f) or {}
-    return ensure_config_structure(config)
-
-
-def save_config(config):
-    config = ensure_config_structure(config)
-    with open('config.yaml', 'w', encoding='utf-8') as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
 
 # --- 页面配置 ---
 st.set_page_config(page_title="Aurum", page_icon="📜")
@@ -474,6 +337,7 @@ else:
         render_tab2()
 
     # 侧边栏
+
     with st.sidebar:
         st.write(f"已登录: **{username}**")
         if st.session_state.get('api_key'):
@@ -504,109 +368,174 @@ else:
                     st.rerun()
                 else:
                     st.error("用户不存在")
-        # 自定义设置区
-        st.sidebar.divider()
-        st.sidebar.subheader("⚙️ 设置")
 
-        # 第一行：删除同步开关
-        col1, col2 = st.sidebar.columns([2, 0.5])
-        with col1:
-            st.write("🗑️ 同步删除归档文件夹")
-        with col2:
-            st.toggle(
-                "",
-                value=st.session_state.get('sync_delete_enabled', get_user_setting('sync_delete_enabled', False)),
-                key="sync_delete_enabled",
-                on_change=lambda: save_user_settings({'sync_delete_enabled': st.session_state.sync_delete_enabled}),
-                label_visibility="collapsed"
-            )
+        with st.expander("⚙️ 高级设置", expanded=False):
+            with st.popover("❓", use_container_width=True):
+                st.markdown("""
+                           **📦 归档模式**：复制-保留原文件；移动-自动删除源文件
 
-        # 第二行：汇总开关 + 诊断下拉框（同行）
-        col1, col2 = st.sidebar.columns([2, 0.5])
-        with col1:
-            st.write("📄 汇总所有就诊记录")
-        with col2:
-            st.toggle(
-                "",
-                value=st.session_state.get('aggregate_visits', get_user_setting('aggregate_visits', False)),
-                key="aggregate_visits",
-                on_change=lambda: save_user_settings({'aggregate_visits': st.session_state.aggregate_visits}),
-                label_visibility="collapsed"
-            )
+                           **📄 汇总记录**：开启后跨目录汇总所有就诊记录
 
-        # 第三行：诊断关键词归属（单独一行）
-        col1, col2 = st.sidebar.columns([2, 2])
-        with col1:
-            st.write("📋 “诊断”作为")
-        with col2:
-            st.selectbox(
-                "",
-                ["中医诊断", "西医诊断"],
-                index=0 if st.session_state.get('diagnosis_keyword_mode', '中医诊断') == '中医诊断' else 1,
-                key="diagnosis_keyword_mode",
-                on_change=lambda: save_user_settings(
-                    {'diagnosis_keyword_mode': st.session_state.diagnosis_keyword_mode}),
-                label_visibility="collapsed"
-            )
+                           **🏥 启用医院/科室层**：开启时归档文件结构为：目标目录/医院/患者，关闭归档文件结构为：目标目录/患者
 
-        # ---- 数据管理（导入/导出） ----
-        st.sidebar.divider()
-        st.sidebar.subheader("💾 数据管理")
+                           **📋 诊断归属**：通用关键词「诊断」归入中医诊断或西医诊断列
 
-        db_path = os.path.abspath("aurum_index.db")
-        st.sidebar.write(f"**数据库文件**：`{db_path}`")
-        if st.sidebar.button("📂 打开数据库所在文件夹", key="open_db_folder"):
-            try:
-                open_folder(db_path)
-            except Exception as e:
-                st.sidebar.error(f"打开失败：{e}")
+                           **🗑️ 删除同步**：开启后删除记录同时永久删除硬盘文件夹
+                           """)
 
-        # 导出
-        st.sidebar.write("**导出数据库**")
-        json_data = export_database()
-        try:
-            temp_data = json.loads(json_data)
-            if not temp_data.get("visits") and not temp_data.get("patient_profiles"):
-                st.sidebar.warning("数据库为空，没有数据可导出。")
-            else:
-                st.sidebar.download_button(
-                    label="📥 下载 JSON 备份",
-                    data=json_data,
-                    file_name=f"aurum_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                    key="export_db"
+            # ---- 从 yaml 加载设置（仅当 session_state 中无此键时） ----
+            if 'archive_mode_display' not in st.session_state:
+                saved_archive = get_user_setting('archive_mode', '复制')
+                st.session_state.archive_mode_display = saved_archive
+                st.session_state.archive_mode = "move" if saved_archive == "移动" else "copy"
+
+            if 'aggregate_visits' not in st.session_state:
+                st.session_state.aggregate_visits = get_user_setting('aggregate_visits', False)
+
+            if 'diagnosis_keyword_mode' not in st.session_state:
+                saved_diag = get_user_setting('diagnosis_keyword_mode', '中医')
+                if saved_diag == "中医诊断":
+                    saved_diag = "中医"
+                elif saved_diag == "西医诊断":
+                    saved_diag = "西医"
+                st.session_state.diagnosis_keyword_mode = saved_diag
+
+            if 'sync_delete_enabled' not in st.session_state:
+                st.session_state.sync_delete_enabled = get_user_setting('sync_delete_enabled', False)
+
+            if 'enable_hospital_layer' not in st.session_state:
+                saved_hospital = get_user_setting('enable_hospital_layer', True)
+                st.session_state.enable_hospital_layer = saved_hospital
+
+            # ---- 渲染控件 ----
+            # 1. 归档模式
+            col1, col2 = st.columns([2, 2])
+            with col1:
+                st.write("📦 归档模式")
+            with col2:
+                st.selectbox(
+                    "",
+                    ["复制", "移动"],
+                    index=0 if st.session_state.archive_mode_display == "复制" else 1,
+                    key="archive_mode_display",
+                    label_visibility="collapsed"
                 )
-        except Exception as e:
-            st.sidebar.error(f"导出数据异常：{e}")
+                st.session_state.archive_mode = "move" if st.session_state.archive_mode_display == "移动" else "copy"
 
-        # 导入
-        st.sidebar.write("**导入数据库**")
-        uploaded_file = st.sidebar.file_uploader("", type="json", key="import_uploader", label_visibility="collapsed")
-        if uploaded_file is not None:
-            mode = st.sidebar.radio("导入模式", ["覆盖", "追加"], horizontal=True, key="import_mode")
-            if st.sidebar.button("执行导入", use_container_width=True):
-                json_str = uploaded_file.read().decode('utf-8')
+            # 2. 汇总记录
+            col1, col2 = st.columns([2, 0.5])
+            with col1:
+                st.write("📄 汇总记录")
+            with col2:
+                st.toggle(
+                    "",
+                    key="aggregate_visits",
+                    label_visibility="collapsed"
+                )
+
+            # 3. 启用医院/科室层
+            col1, col2 = st.columns([2, 0.5])
+            with col1:
+                st.write("🏥 启用医院/科室层")
+            with col2:
+                st.toggle(
+                    "",
+                    key="enable_hospital_layer",
+                    label_visibility="collapsed"
+                )
+
+            # 4. “诊断”归属
+            col1, col2 = st.columns([2, 2])
+            with col1:
+                st.write("📋 “诊断”归属")
+            with col2:
+                st.selectbox(
+                    "",
+                    ["中医", "西医"],
+                    index=0 if st.session_state.diagnosis_keyword_mode == "中医" else 1,
+                    key="diagnosis_keyword_mode",
+                    label_visibility="collapsed"
+                )
+
+            # 5. 删除同步
+            col1, col2 = st.columns([2, 0.5])
+            with col1:
+                st.write("🗑️ 同步删除")
+            with col2:
+                st.toggle(
+                    "",
+                    key="sync_delete_enabled",
+                    label_visibility="collapsed"
+                )
+
+            # ---- 保存设置 ----
+            if st.button("✅ 应用设置", use_container_width=True):
+                settings_to_save = {
+                    'archive_mode': st.session_state.archive_mode_display,
+                    'aggregate_visits': st.session_state.aggregate_visits,
+                    'diagnosis_keyword_mode': st.session_state.diagnosis_keyword_mode,
+                    'sync_delete_enabled': st.session_state.sync_delete_enabled,
+                    'enable_hospital_layer': st.session_state.enable_hospital_layer,
+                }
+                for key, value in settings_to_save.items():
+                    save_user_settings({key: value})
+
+                st.toast("设置已应用！", icon="✅")
+                st.rerun()
+
+        # ---- 数据管理（折叠） ----
+        with st.sidebar.expander("💾 数据管理", expanded=False):
+            db_path = os.path.abspath("aurum_index.db")
+            st.write(f"**数据库文件**：`{db_path}`")
+            if st.button("📂 打开数据库所在文件夹", key="open_db_folder"):
                 try:
-                    temp_data = json.loads(json_str)
-                    if not temp_data or (not temp_data.get("visits") and not temp_data.get("patient_profiles")):
-                        st.sidebar.error("所选文件为空，请检查文件内容。")
-                    else:
-                        if mode == "覆盖":
-                            success, msg = import_database(json_str, mode="overwrite")
-                        else:
-                            success, msg = import_database(json_str, mode="append")
-                        if success:
-                            st.session_state.pending_toast = "数据库导入成功！"
-                            st.rerun()
-                        else:
-                            st.sidebar.error(f"导入失败：{msg}")
-                except json.JSONDecodeError:
-                    st.sidebar.error("所选文件不是有效的 JSON 格式，请检查文件内容。")
+                    open_folder(db_path)
+                except Exception as e:
+                    st.error(f"打开失败：{e}")
 
-        # ---- 版本号 + 联系方式 ----
+            st.write("**导出数据库**")
+            json_data = export_database()
+            try:
+                temp_data = json.loads(json_data)
+                if not temp_data.get("visits") and not temp_data.get("patient_profiles"):
+                    st.warning("数据库为空，没有数据可导出。")
+                else:
+                    st.download_button(
+                        label="📥 下载 JSON 备份",
+                        data=json_data,
+                        file_name=f"aurum_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json",
+                        use_container_width=True,
+                        key="export_db"
+                    )
+            except Exception as e:
+                st.error(f"导出数据异常：{e}")
+
+            st.write("**导入数据库**")
+            uploaded_file = st.file_uploader("", type="json", key="import_uploader", label_visibility="collapsed")
+            if uploaded_file is not None:
+                mode = st.radio("导入模式", ["覆盖", "追加"], horizontal=True, key="import_mode")
+                if st.button("执行导入", use_container_width=True):
+                    json_str = uploaded_file.read().decode('utf-8')
+                    try:
+                        temp_data = json.loads(json_str)
+                        if not temp_data or (not temp_data.get("visits") and not temp_data.get("patient_profiles")):
+                            st.error("所选文件为空，请检查文件内容。")
+                        else:
+                            if mode == "覆盖":
+                                success, msg = import_database(json_str, mode="overwrite")
+                            else:
+                                success, msg = import_database(json_str, mode="append")
+                            if success:
+                                st.session_state.pending_toast = "数据库导入成功！"
+                                st.rerun()
+                            else:
+                                st.error(f"导入失败：{msg}")
+                    except json.JSONDecodeError:
+                        st.error("所选文件不是有效的 JSON 格式，请检查文件内容。")
+
+        # ---- 版本号 + 联系方式（保持在折叠栏下方） ----
         st.sidebar.divider()
-        # 在侧边栏合适位置（比如在设置区域后面）
         if st.sidebar.button("🔍 检查更新", use_container_width=True):
             check_for_updates(show_ignore=False, silent_if_up_to_date=False)
         st.sidebar.caption(f"版本 v{CURRENT_VERSION}")

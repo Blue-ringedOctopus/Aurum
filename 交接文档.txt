@@ -1,5 +1,5 @@
 【项目名称】Aurum - 中医病历智能整理工具
-【当前状态】已发布 v1.0.0（Windows + macOS），约35人测试。根据测试反馈，已修复若干bug，并调整了自动更新方案。当前正在准备 v1.0.1 或 v1.0.2 的发布，主要包含bug修复和UI优化。
+【当前状态】已发布 v1.0.2。当前正在准备 专业版 的发布，主要包含平台迁移、bug修复和UI优化。
 
 【项目定位】
 帮助中医学生/临床医生整理散落在各日期文件夹中的患者病历资料，自动重组为“医院/患者/就诊日期”结构，存入SQLite本地数据库，支持搜索、筛选、分组、批量编辑、删除，并提供AI辅助功能（中医证型识别、方剂识别、按语生成）。
@@ -48,12 +48,11 @@ macOS 版本通过 GitHub Actions 自动构建（工作流文件 .github/workflo
 构建时需注意：requirements.txt 中不能包含 pywin32，因为 macOS 无法安装。需将 pywin32 单独在 Windows 构建步骤中安装。
 macOS 用户首次打开需右键 -> 打开，或通过终端执行 sudo xattr -d com.apple.quarantine /path/to/Aurum.app 移除隔离属性。
 当前 macOS 版本已成功构建并分发，用户反馈不可打开（因为开发者证书原因）。
-目前打算放弃mac版本
+目前放弃mac版本
 
 【未来功能开发计划（按优先级排序）】
-增加自由度：可选是否需要医院/科室层文件夹。
-归档模式扩展：增加“复制模式”（现有）和“移动模式”（剪切原始文件）。
 升级成独立本地软件。
+增加“学习”、“笔记”版块
 本地OCR集成（PaddleOCR/Tesseract），识别图片中的文字。
 预处理文件夹工具：帮助用户将杂乱的原始文件夹整理成Aurum可识别的格式（日期/患者文件夹）。
 西医版（独立分支或模式）。
@@ -61,14 +60,12 @@ macOS 用户首次打开需右键 -> 打开，或通过终端执行 sudo xattr -
 【打包与发布须知】
 使用 PyInstaller 的 onedir 模式（不是 onefile），因为启动更快，便于后续更新替换部分文件。
 打包命令（示例）：
-  pyinstaller --onedir --noconsole --icon=Aurum.ico --name Aurum --add-data "aurum_core;aurum_core" --add-data "README.txt;." --add-data "aurum_app.py;." --hidden-import streamlit ... --collect-all streamlit --collect-all certifi run.py
+  pyinstaller --onedir --noconsole --icon=Aurum.ico --name Aurum --add-data "aurum_core;aurum_core" --add-data "README.txt;." --add-data "aurum_app.py;." --hidden-import streamlit --hidden-import pypinyin --hidden-import docx --hidden-import openpyxl --hidden-import requests --hidden-import yaml --hidden-import bcrypt --hidden-import psutil --hidden-import openai --hidden-import pandas --hidden-import pyarrow --hidden-import packaging --collect-all streamlit --collect-all certifi --collect-all pypinyin --collect-all docx --collect-all openpyxl --collect-all requests --collect-all yaml --collect-all bcrypt --collect-all psutil --collect-all openai --collect-all pandas run.py
 具体参数参见项目根目录下的 aurum.spec 文件（若有）。
 打包前确保已删除 build/ 和 dist/ 目录，以免残留。
-当前分发版本为 v1.0.0（Windows）和 v1.0.0（macOS 通过 GitHub Actions 构建）。
 
 【测试与反馈】
-目前测试群体约35人（中医学生/医生），反馈较少，推测用户尚未广泛使用。
-下一次发布应包含上述已修复问题，并考虑增加内置反馈渠道（如侧边栏“反馈”按钮跳转 GitHub Issues）。
+目前尚未广泛使用。
 
 【备注】
 项目代码托管于 GitHub 私有仓库（Blue-ringedOctopus/Aurum）。

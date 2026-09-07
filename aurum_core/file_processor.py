@@ -2,10 +2,11 @@
 import os
 import sqlite3
 import shutil
-import json
 from aurum_core.database import get_db_path
-from aurum_core.text_utils import read_file_content, normalize_date_str, extract_diagnosis
+from aurum_core.text_utils import read_file_content, normalize_date_str
 import re
+from aurum_core.user_settings import get_user_setting
+
 DATE_PATTERN = re.compile(
     r'^(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}[日号]|'
     r'\d{8}|\d{6}|\d{2}年\d{1,2}月\d{1,2}[日号])(?:\s*)(.*)$'
@@ -172,33 +173,29 @@ def _find_medical_file(folder_path: str) -> str:
     return None
 
 def _insert_visit_record(cursor, patient: str, visit_date: str, hospital: str, docx_path: str):
+    """
+    插入或更新就诊记录。
+    返回值：
+        - "inserted": 成功插入新记录
+        - "updated": 更新了已有记录
+        - "empty": 文件为空
+        - "occupied": 文件被占用
+        - False: 其他错误
+    """
     if not os.path.exists(docx_path):
         return False
     if os.path.getsize(docx_path) == 0:
-        return False
+        return "empty"
 
     try:
         content = read_file_content(docx_path)
     except (PermissionError, OSError):
-        # 文件被占用（如 Word 打开），返回特殊标记
         return "occupied"
     except Exception:
         return False
 
     if not content or not content.strip():
-        return False
-
-    # 尝试读取文件内容，捕获权限错误
-    try:
-        content = read_file_content(docx_path)
-    except PermissionError:
-        # 文件被占用（如 Word 打开），返回 False 并记录特殊日志
-        return "occupied"
-    except Exception:
-        return False
-
-    if not content or not content.strip():
-        return False
+        return "empty"
 
     try:
         cursor.execute(
@@ -209,19 +206,26 @@ def _insert_visit_record(cursor, patient: str, visit_date: str, hospital: str, d
 
         if existing:
             cursor.execute(
-                "UPDATE visits SET docx_path = ?, full_medical_text = ? WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
-                (docx_path, content, patient, visit_date, hospital)
+                "UPDATE visits SET docx_path = ?, full_medical_text = ? WHERE id = ?",
+                (docx_path, content, existing[0])
             )
+            action = "updated"
         else:
             cursor.execute('''
                 INSERT INTO visits 
                 (patient_name, visit_date, hospital, docx_path, full_medical_text)
                 VALUES (?, ?, ?, ?, ?)
             ''', (patient, visit_date, hospital, docx_path, content))
+            action = "inserted"
 
-        from aurum_core.text_utils import extract_diagnosis
-        tcm_list, wm_list = extract_diagnosis(content, default_to_tcm=True)
+        # ========== 提取诊断（读取用户偏好） ==========
+        import streamlit as st
         import json
+        from aurum_core.text_utils import extract_diagnosis
+
+        diag_mode = get_user_setting('diagnosis_keyword_mode', '中医')
+        default_to_tcm = (diag_mode == "中医")
+        tcm_list, wm_list = extract_diagnosis(content, default_to_tcm=default_to_tcm)
         if tcm_list:
             cursor.execute(
                 "UPDATE visits SET diagnosis = ? WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
@@ -232,28 +236,38 @@ def _insert_visit_record(cursor, patient: str, visit_date: str, hospital: str, d
                 "UPDATE visits SET western_diagnosis = ? WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
                 (json.dumps(wm_list, ensure_ascii=False), patient, visit_date, hospital)
             )
-        return True
+        return action
     except Exception:
         return False
 
-def _insert_empty_visit_record(cursor, patient: str, visit_date: str, hospital: str, date_folder_path: str) -> bool:
+def _insert_empty_visit_record(cursor, patient: str, visit_date: str, hospital: str, date_folder_path: str, docx_path_override: str = None) -> str:
     """
-    向 visits 表插入一条空记录（无 docx_path，无 full_medical_text）。
-    用于患者文件夹存在但无文档文件的情况。
-    返回 True 表示插入成功（或已存在），False 表示失败。
+    插入空记录。
+    返回值：
+        - "inserted": 成功插入新记录
+        - "updated": 更新了已有记录（路径变化）
+        - False: 错误
     """
     try:
         cursor.execute(
             "SELECT id FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
             (patient, visit_date, hospital)
         )
-        if cursor.fetchone():
-            return True  # 已存在，视为成功
-        cursor.execute(
-            "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, NULL, NULL, ?)",
-            (patient, visit_date, hospital, date_folder_path)
-        )
-        return True
+        existing = cursor.fetchone()
+
+        if existing:
+            # 已有记录，更新路径
+            cursor.execute(
+                "UPDATE visits SET docx_path = ?, full_medical_text = NULL, date_folder_path = ? WHERE id = ?",
+                (docx_path_override, date_folder_path, existing[0])
+            )
+            return "updated"
+        else:
+            cursor.execute(
+                "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, ?, NULL, ?)",
+                (patient, visit_date, hospital, docx_path_override, date_folder_path)
+            )
+            return "inserted"
     except Exception:
         return False
 
@@ -276,7 +290,17 @@ def is_archived_structure(root_path: str) -> bool:
                 return True
     return False
 
-def reorganize_files(src, tgt, aggregate: bool = False):
+def reorganize_files(src, tgt, aggregate: bool = False, mode: str = "copy"):
+    """
+    归档整理主函数
+
+    参数:
+        src: 源目录
+        tgt: 目标目录
+        aggregate: 是否汇总就诊记录
+        mode: "copy" 复制模式（默认）或 "move" 移动模式
+    """
+
     # --- 第一步：检查源目录 ---
     if not os.path.exists(src):
         return "❌ 源路径不存在，请检查"
@@ -292,6 +316,11 @@ def reorganize_files(src, tgt, aggregate: bool = False):
     base_name = os.path.basename(src)
     match_root = DATE_PATTERN.match(base_name)
     log_lines = []
+
+    # ========== 新增：显示归档模式 ==========
+    mode_display = "复制" if mode == "copy" else "移动"
+    log_lines.append(f"📦 模式：{mode_display}")
+    log_lines.append("")
 
     if match_root and os.path.isdir(src):
         # 根目录本身就是日期文件夹 → 结构A
@@ -313,7 +342,7 @@ def reorganize_files(src, tgt, aggregate: bool = False):
             hospital_candidates = [f for f in items if os.path.isdir(os.path.join(src, f))]
             if hospital_candidates:
                 return (
-                    "❌ 检测到您输入的是已整理好的归档文件夹（医院/患者/日期），请使用的「🔄 刷新数据库」"
+                    "❌ 检测到您输入的是已整理好的归档文件夹（医院/患者/日期），请使用「🔄 刷新数据库」"
                 )
             else:
                 return "⚠️ 归档失败：根目录下既没有日期文件夹，也没有可识别的医院文件夹。请确认源目录是否正确。"
@@ -336,6 +365,9 @@ def reorganize_files(src, tgt, aggregate: bool = False):
 
     patient_data = {}
     total_patients = 0
+
+    # ========== 新增：记录成功复制的路径（用于移动模式） ==========
+    copied_paths = []
 
     # 统计总记录数
     total_visits = 0
@@ -374,7 +406,11 @@ def reorganize_files(src, tgt, aggregate: bool = False):
         for patient_raw in patient_folders:
             patient = clean_patient_name(patient_raw)
             patient_src_path = os.path.join(date_path, patient_raw)
-            patient_tgt_path = os.path.join(tgt, hospital_name, patient, pure_date)
+            enable_hospital_layer = get_user_setting('enable_hospital_layer', True)
+            if enable_hospital_layer:
+                patient_tgt_path = os.path.join(tgt, hospital_name, patient, pure_date)
+            else:
+                patient_tgt_path = os.path.join(tgt, patient, pure_date)
 
             if patient not in patient_data:
                 patient_data[patient] = {
@@ -400,16 +436,27 @@ def reorganize_files(src, tgt, aggregate: bool = False):
             if file_count == 0:
                 # 创建目标目录（空文件夹）
                 os.makedirs(patient_tgt_path, exist_ok=True)
+                # ========== 新增：空文件夹也记录到 copied_paths ==========
+                if mode == "move":
+                    copied_paths.append((patient_src_path, patient_tgt_path))
                 # 插入空记录
                 if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
-                    log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）文件夹为空，已创建空记录")
+                    log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）文件夹为空，已处理")
                     total_patients += 1
                 else:
                     log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败")
                 continue
 
-            shutil.copytree(patient_src_path, patient_tgt_path, dirs_exist_ok=True)
-            total_patients += 1
+            # ========== 修改：复制文件夹，记录成功路径 ==========
+            try:
+                shutil.copytree(patient_src_path, patient_tgt_path, dirs_exist_ok=True)
+                if mode == "move":
+                    copied_paths.append((patient_src_path, patient_tgt_path))
+                # ========== 修改：日志泛化为「已处理」 ==========
+                log_lines.append(f"   ✅ {patient}（{pure_date}）已处理")
+            except Exception as e:
+                log_lines.append(f"   ❌ {patient}（{pure_date}）复制失败：{e}")
+                continue
 
             # 使用 select_medical_file 智能选择病历文件
             docx_file, select_status = select_medical_file(patient_tgt_path, pure_date)
@@ -418,22 +465,75 @@ def reorganize_files(src, tgt, aggregate: bool = False):
 
             if docx_file:
                 result = _insert_visit_record(cursor, patient, pure_date, hospital_name, docx_file)
-                if result is True:
+                if result == "inserted":
                     total_patients += 1
+                elif result == "updated":
+                    log_lines.append(
+                        f"   ⚠️ {patient}（{pure_date}，{hospital_name}）记录已存在，已更新文件内容"
+                    )
                 elif result == "occupied":
                     log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件被占用，请关闭后重试")
+                elif result == "empty":
+                    if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path,
+                                                  docx_file):
+                        log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）病历文件为空，已创建空记录")
+                        total_patients += 1
+                    else:
+                        log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败")
                 else:
                     log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件无效或为空，已跳过")
-            else:
-                # 无文档文件 → 创建空记录
-                if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
-                    log_lines.append(
-                        f"   ⚠️ {patient}（{pure_date}，{hospital_name}）未找到病历文件")
-                    total_patients += 1  # 虽然无文档，但仍计入已处理患者
-                else:
-                    log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败，请检查数据库")
 
     conn.commit()
+
+    # ========== 新增：第二阶段：移动模式下删除源文件 ==========
+    if mode == "move" and copied_paths:
+        log_lines.append("")
+        log_lines.append("📦 正在删除原始文件...")
+        deleted_count = 0
+        failed_count = 0
+        cleaned_parents = set()
+
+        for src_path, tgt_path in copied_paths:
+            if not os.path.exists(src_path):
+                continue
+            try:
+                shutil.rmtree(src_path)
+                deleted_count += 1
+
+                # ---- 清理空的父目录（向上直到源根目录的前一层） ----
+                parent = os.path.dirname(src_path)
+                while parent and os.path.exists(parent):
+                    # 如果父目录就是源目录本身，停止向上清理（留到最后单独处理）
+                    if os.path.abspath(parent) == os.path.abspath(src):
+                        break
+                    try:
+                        if not os.listdir(parent):
+                            os.rmdir(parent)
+                            cleaned_parents.add(parent)
+                            parent = os.path.dirname(parent)
+                        else:
+                            break
+                    except (OSError, PermissionError):
+                        break
+            except Exception as e:
+                log_lines.append(f"   ⚠️ 删除失败：{src_path}，错误：{e}")
+                failed_count += 1
+
+            # ========== 新增：删除空的源根目录 ==========
+        if os.path.exists(src) and os.path.isdir(src):
+            try:
+                if not os.listdir(src):
+                    os.rmdir(src)
+                    log_lines.append(f"   🧹 已清理空的源目录：{src}")
+            except Exception as e:
+                log_lines.append(f"   ⚠️ 清理源目录失败：{src}，错误：{e}")
+
+        if failed_count == 0:
+            log_lines.append(f"✅ 已删除 {deleted_count} 个原始文件夹")
+            if cleaned_parents:
+                log_lines.append(f"   🧹 已清理 {len(cleaned_parents)} 个空的父目录")
+        else:
+            log_lines.append(f"⚠️ 已删除 {deleted_count} 个，{failed_count} 个删除失败（文件保留在源目录）")
 
     # ---- 提取个人信息并生成档案（结构A专用） ----
     if total_patients > 0:
@@ -453,265 +553,6 @@ def reorganize_files(src, tgt, aggregate: bool = False):
 
     conn.close()
     log_lines.append(f"\n🎉 归档完成！请前往 `{tgt}` 查看整理后的文件。")
-    return "\n".join(log_lines)
-
-def reorganize_single_hospital(hospital_path: str, tgt_root: str, hospital_name: str) -> str:
-    """
-    处理单个医院文件夹，支持两种结构：
-    1. 医院/日期/患者（未归档） → 复制文件到目标目录，并更新数据库 + 生成档案
-    2. 医院/患者/日期（已归档） → 只更新数据库，完全不碰目标目录（不创建任何文件夹或文件）
-    """
-    import shutil
-    from aurum_core.text_utils import read_file_content, normalize_date_str, extract_diagnosis
-
-    if not os.path.exists(hospital_path):
-        return f"❌ 医院路径不存在：{hospital_path}"
-
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    log_lines = []
-    total_success = 0
-    total_failed = 0
-    total_skipped = 0
-    updated_patients = []   # 仅用于结构A
-
-    items = os.listdir(hospital_path)
-    subdirs = [f for f in items if os.path.isdir(os.path.join(hospital_path, f))]
-
-    if not subdirs:
-        return f"⚠️ 医院 [{hospital_name}] 下没有子目录"
-
-    date_folders = [f for f in subdirs if DATE_PATTERN.match(f)]
-
-    # ========== 结构A：医院/日期/患者（复制模式） ==========
-    if date_folders:
-        log_lines.append(f"🏥 处理科室：{hospital_name}（日期→患者结构，【复制模式】）")
-        for date_folder in date_folders:
-            date_path = os.path.join(hospital_path, date_folder)
-            m = DATE_PATTERN.match(date_folder)
-            if not m:
-                continue
-            raw_date = m.group(1)
-            pure_date = normalize_date_str(raw_date)
-
-            patient_folders = [p for p in os.listdir(date_path) if os.path.isdir(os.path.join(date_path, p))]
-            for patient_raw in patient_folders:
-                patient = clean_patient_name(patient_raw)
-                patient_src_path = os.path.join(date_path, patient_raw)
-                patient_tgt_path = os.path.join(tgt_root, hospital_name, patient, pure_date)
-
-                # 检查是否为空文件夹
-                file_count = sum(len(files) for _, _, files in os.walk(patient_src_path))
-                if file_count == 0:
-                    os.makedirs(patient_tgt_path, exist_ok=True)
-                    if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
-                        log_lines.append(f"   ⚠️ {patient}（{pure_date}，{hospital_name}）文件夹为空，已创建空记录")
-                        total_success += 1
-                        updated_patients.append(patient)
-                    else:
-                        log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败")
-                        total_failed += 1
-                    continue
-
-                # 复制整个文件夹
-                try:
-                    shutil.copytree(patient_src_path, patient_tgt_path, dirs_exist_ok=True)
-                except Exception as e:
-                    log_lines.append(f"   ❌ {patient}（{pure_date}）复制失败：{e}")
-                    total_failed += 1
-                    continue
-
-                # 查找病历文件
-                docx_file, select_status = select_medical_file(patient_tgt_path, pure_date)
-                if select_status:
-                    log_lines.append(f"   ℹ️ {patient}（{pure_date}）{select_status}")
-
-                if docx_file:
-                    result = _insert_visit_record(cursor, patient, pure_date, hospital_name, docx_file)
-                    if result is True:
-                        total_success += 1
-                        updated_patients.append(patient)
-                    elif result == "occupied":
-                        log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件被占用，请关闭后重试")
-                        total_failed += 1
-                    else:
-                        log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件无效或为空，已跳过")
-                        total_failed += 1
-                else:
-                    # 无文档文件 → 创建空记录
-                    if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_tgt_path):
-                        log_lines.append(
-                            f"   ⚠️ {patient}（{pure_date}，{hospital_name}）未找到病历文件")
-                        total_success += 1  # 视为成功（至少记录了患者信息）
-                        updated_patients.append(patient)  # 后续仍会生成档案
-                    else:
-                        log_lines.append(f"   ❌ {patient}（{pure_date}，{hospital_name}）创建空记录失败，请检查数据库")
-                        total_failed += 1
-
-        conn.commit()
-        conn.close()
-
-        # ---- 结构A专有：提取个人信息 + 生成档案 ----
-        if updated_patients:
-            try:
-                from aurum_core.extract_patient_profiles import update_all_profiles
-                update_all_profiles()
-            except Exception as e:
-                log_lines.append(f"   ⚠️ 自动提取个人信息失败：{e}")
-
-            from aurum_core.file_processor import update_patient_archive_by_db
-            for patient in set(updated_patients):
-                try:
-                    update_patient_archive_by_db(patient, aggregate=False)
-                except Exception as e:
-                    log_lines.append(f"   ⚠️ 生成档案失败（{patient}）：{e}")
-
-        log_lines.append(f"📊 {hospital_name}：成功 {total_success} 位，失败 {total_failed} 位，跳过 {total_skipped} 个空文件夹")
-        return "\n".join(log_lines)
-
-    # ========== 结构B：医院/患者/日期（【仅刷新数据库，绝不创建任何文件夹】） ==========
-    else:
-        log_lines.append(f"🏥 处理科室：{hospital_name}（患者→日期结构，【仅刷新数据库，不创建任何文件夹】）")
-        for patient_raw in subdirs:
-            patient = clean_patient_name(patient_raw)
-            patient_path = os.path.join(hospital_path, patient_raw)
-            # 获取该患者下的所有日期子文件夹
-            date_subdirs = [f for f in os.listdir(patient_path)
-                            if os.path.isdir(os.path.join(patient_path, f)) and DATE_PATTERN.match(f)]
-            if not date_subdirs:
-                log_lines.append(f"   ⚠️ {patient} 文件夹下没有日期子文件夹，跳过")
-                total_skipped += 1
-                continue
-
-            for date_folder in date_subdirs:
-                m = DATE_PATTERN.match(date_folder)
-                if not m:
-                    continue
-                raw_date = m.group(1)
-                pure_date = normalize_date_str(raw_date)
-                patient_date_path = os.path.join(patient_path, date_folder)  # 日期文件夹路径
-
-                # 检查是否为空
-                file_count = sum(len(files) for _, _, files in os.walk(patient_date_path))
-                if file_count == 0:
-                    log_lines.append(f"   ⚠️ {patient}（{pure_date}）文件夹为空，跳过")
-                    total_skipped += 1
-                    continue
-
-                # 查找病历文件（源路径）
-                docx_file, select_status = select_medical_file(patient_date_path, pure_date)
-                if select_status:
-                    log_lines.append(f"   ℹ️ {patient}（{pure_date}）{select_status}")
-
-                if docx_file:
-                    result = _insert_visit_record(cursor, patient, pure_date, hospital_name, docx_file)
-                    if result is True:
-                        total_success += 1
-                    elif result == "occupied":
-                        log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件被占用，请关闭后重试")
-                        total_failed += 1
-                    else:
-                        log_lines.append(f"   ⚠️ {patient}（{pure_date}）病历文件无效或为空，已跳过")
-                        total_failed += 1
-                else:
-                    # 插入空记录
-                    if _insert_empty_visit_record(cursor, patient, pure_date, hospital_name, patient_date_path):
-                        log_lines.append(f"   ℹ️ {patient}（{pure_date}）未找到病历文件，已创建空记录")
-                        total_success += 1
-                    else:
-                        log_lines.append(f"   ❌ {patient}（{pure_date}）创建空记录失败")
-                        total_failed += 1
-
-        conn.commit()
-        conn.close()
-        log_lines.append(
-            f"📊 {hospital_name}：成功更新 {total_success} 条记录，失败 {total_failed} 条，跳过 {total_skipped} 个空文件夹")
-        log_lines.append("✅ 处理完成：未在目标目录创建任何文件或文件夹，仅数据库已同步。")
-        return "\n".join(log_lines)
-
-def read_word_content(doc_path):
-    from docx import Document
-    doc = Document(doc_path)
-    text = []
-    for para in doc.paragraphs:
-        if para.text:
-            text.append(para.text)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                if cell.text:
-                    text.append(cell.text)
-    return "\n".join(text)
-
-def reindex_archived_folder(tgt_root: str) -> str:
-    """
-    重建索引：扫描归档文件夹，更新 visits 表中的 docx_path。
-    不覆盖诊断、方剂等已有数据，只更新文件路径。
-    """
-    if not os.path.exists(tgt_root):
-        return "❌ 路径不存在，请检查"
-
-    try:
-        sub_items = os.listdir(tgt_root)
-        has_hospital_folder = any(os.path.isdir(os.path.join(tgt_root, f)) for f in sub_items)
-        if not has_hospital_folder:
-            return "⚠️ 路径下没有找到医院/科室文件夹，请确保路径指向归档根目录（如 D:/test_Aurum归档）"
-    except PermissionError:
-        return "⛔ 没有权限读取该文件夹"
-
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    total_updated = 0
-    total_missing = 0
-    log_lines = []
-    log_lines.append(f"🔍 开始重建索引，根目录：{tgt_root}")
-
-    for hospital in os.listdir(tgt_root):
-        hospital_path = os.path.join(tgt_root, hospital)
-        if not os.path.isdir(hospital_path):
-            continue
-
-        for patient in os.listdir(hospital_path):
-            patient_path = os.path.join(hospital_path, patient)
-            if not os.path.isdir(patient_path):
-                continue
-
-            for date_folder in os.listdir(patient_path):
-                date_path = os.path.join(patient_path, date_folder)
-                if not os.path.isdir(date_path):
-                    continue
-
-                docx_file = None
-                for f in os.listdir(date_path):
-                    if f.lower().endswith(('.docx', '.doc', '.txt')):
-                        docx_file = os.path.join(date_path, f)
-                        break
-
-                if not docx_file:
-                    log_lines.append(f"   ⚠️ 缺失病历：{patient}/{date_folder}")
-                    total_missing += 1
-                    continue
-
-                cursor.execute(
-                    "UPDATE visits SET docx_path = ? WHERE patient_name = ? AND visit_date = ?",
-                    (docx_file, patient, date_folder)
-                )
-                if cursor.rowcount > 0:
-                    total_updated += 1
-                else:
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO visits (patient_name, visit_date, hospital, docx_path)
-                        VALUES (?, ?, ?, ?)
-                    ''', (patient, date_folder, hospital, docx_file))
-                    if cursor.rowcount > 0:
-                        total_updated += 1
-
-    conn.commit()
-    log_lines.append(f"\n📊 重建索引完成！共更新 {total_updated} 条记录，缺失 {total_missing} 个病历文件。")
     return "\n".join(log_lines)
 
 def update_patient_archive_by_db(patient_name: str, aggregate: bool = False):
@@ -763,10 +604,16 @@ def update_patient_archive_by_db(patient_name: str, aggregate: bool = False):
         visit_date, hospital, diagnosis, prescription, remarks, docx_path = row
         if docx_path and os.path.exists(docx_path):
             # 提取根目录：.../根目录/医院/患者/日期/病历.docx
-            date_folder = os.path.dirname(docx_path)
-            patient_folder = os.path.dirname(date_folder)  # .../根目录/医院/患者
-            hospital_folder = os.path.dirname(patient_folder)  # .../根目录/医院
-            root = os.path.dirname(hospital_folder)  # .../根目录
+            enable_hospital_layer = get_user_setting('enable_hospital_layer', True)
+            if enable_hospital_layer:
+                date_folder = os.path.dirname(docx_path)
+                patient_folder = os.path.dirname(date_folder)
+                hospital_folder = os.path.dirname(patient_folder)
+                root = os.path.dirname(hospital_folder)
+            else:
+                date_folder = os.path.dirname(docx_path)
+                patient_folder = os.path.dirname(date_folder)
+                root = os.path.dirname(patient_folder)
             root_to_rows[root].append(row)
             all_rows.append(row)
         else:
@@ -827,7 +674,13 @@ def update_patient_archive_by_db(patient_name: str, aggregate: bool = False):
         for row in rows_in_root:
             _, hospital, _, _, _, docx_path = row
             if docx_path and os.path.exists(docx_path):
-                patient_dir = os.path.join(root, hospital, patient_name)
+                # 根据医院层设置决定档案文件路径
+                enable_hospital_layer = get_user_setting('enable_hospital_layer', True)
+                if enable_hospital_layer:
+                    patient_dir = os.path.join(root, hospital, patient_name)
+                else:
+                    # 无医院层模式下，档案文件直接放在根目录/患者姓名/下
+                    patient_dir = os.path.join(root, patient_name)
                 archive_path = os.path.join(patient_dir, "_患者档案.txt")
                 os.makedirs(patient_dir, exist_ok=True)
                 try:
@@ -853,8 +706,6 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
     except PermissionError:
         return "⛔ 没有权限读取源文件夹"
 
-    # ---- 检测是否为结构A（日期文件夹） ----
-    # ---- 检测是否为已归档结构（医院/患者/日期） ----
     if not is_archived_structure(src_root):
         return (
             "❌ 检测到未整理病历（日期/患者），请使用主界面的「归档整理」功能进行复制归档。\n"
@@ -864,6 +715,7 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
     log_lines = []
     log_lines.append(f"🔄 开始刷新数据库索引（仅更新，不复制文件）...")
     log_lines.append(f"📂 根目录：{src_root}")
+    log_lines.append("")
 
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
@@ -872,12 +724,10 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
     total_updated = 0
     total_inserted = 0
     total_errors = 0
-    total_skipped_no_file = 0
-    total_skipped_empty = 0
-    total_skipped_occupied = 0
-    total_skipped_date_parse = 0
 
-    # ---- 直接扫描三层结构：医院/患者/日期 ----
+    # 这些变量用于统计，但不单独记录日志（统一用日志行体现）
+    # total_skipped_no_file, total_skipped_empty 等移除，用日志行本身说明
+
     for hospital in os.listdir(src_root):
         hospital_path = os.path.join(src_root, hospital)
         if not os.path.isdir(hospital_path):
@@ -893,33 +743,29 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
                 pure_date = normalize_date_str(date_folder)
                 if not pure_date:
                     log_lines.append(
-                        f"   ⚠️ 患者 {patient} | {date_folder} ：日期格式无法解析，跳过"
+                        f"   ⚠️ 患者 {patient} | {date_folder} | 医院 {hospital} ：日期格式无法解析，跳过"
                     )
-                    total_skipped_date_parse += 1
                     total_errors += 1
                     continue
 
-                # 查找第一个文档文件
                 docx_file = None
                 for f in os.listdir(date_path):
                     f_path = os.path.join(date_path, f)
                     if os.path.isfile(f_path) and f.lower().endswith(('.docx', '.doc', '.txt')):
                         docx_file = f_path
                         break
+
+                # ========== 情况1：无文档文件 ==========
                 if not docx_file:
                     cursor.execute(
                         "SELECT id, date_folder_path FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
-                        (patient, pure_date, hospital))
+                        (patient, pure_date, hospital)
+                    )
                     row = cursor.fetchone()
                     if row:
-                        # 已有记录，检查 date_folder_path 是否需要更新
-                        existing_id, current_path = row
-                        if current_path != date_path:
-                            cursor.execute("UPDATE visits SET date_folder_path = ? WHERE id = ?",
-                                           (date_path, existing_id))
-                            log_lines.append(f"   ℹ️ 更新空记录路径：患者 {patient} | {pure_date} | 医院 {hospital}")
+                        # 记录存在，路径可能变化，但用户不关心路径变化，所以不输出
+                        pass
                     else:
-                        # 插入空记录
                         cursor.execute(
                             "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, NULL, NULL, ?)",
                             (patient, pure_date, hospital, date_path)
@@ -929,52 +775,138 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
                             f"   ℹ️ 患者 {patient} | {pure_date} | 医院 {hospital} ：无文档文件，已创建空记录")
                     continue
 
-                # 读取文件内容，区分具体错误
+                # ========== 情况2：文件大小为0 ==========
+                file_size = os.path.getsize(docx_file)
+                if file_size == 0:
+                    cursor.execute(
+                        "SELECT id, full_medical_text FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
+                        (patient, pure_date, hospital)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        existing_id, current_text = row
+                        if current_text and current_text.strip():
+                            # 以前有内容，现在变成空文件 -> 记录
+                            cursor.execute(
+                                "UPDATE visits SET docx_path = ?, full_medical_text = NULL, date_folder_path = ? WHERE id = ?",
+                                (docx_file, date_path, existing_id)
+                            )
+                            total_updated += 1
+                            log_lines.append(
+                                f"   ⚠️ 患者 {patient} | {pure_date} | 医院 {hospital} ：文件已被清空（0字节），已更新为空记录"
+                            )
+                        else:
+                            # 以前就是空，只更新路径，不记日志
+                            cursor.execute(
+                                "UPDATE visits SET docx_path = ?, date_folder_path = ? WHERE id = ?",
+                                (docx_file, date_path, existing_id)
+                            )
+                            total_updated += 1
+                    else:
+                        cursor.execute(
+                            "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, ?, NULL, ?)",
+                            (patient, pure_date, hospital, docx_file, date_path)
+                        )
+                        total_inserted += 1
+                        log_lines.append(
+                            f"   ℹ️ 患者 {patient} | {pure_date} | 医院 {hospital} ：文件为空（0字节），已创建空记录")
+                    continue
+
+                # ========== 读取文件内容 ==========
                 try:
                     content = read_file_content(docx_file)
                 except (PermissionError, OSError):
                     log_lines.append(
-                        f"   ⚠️ 患者 {patient} | {pure_date} ：文件被占用（{docx_file}），跳过"
+                        f"   ⚠️ 患者 {patient} | {pure_date} | 医院 {hospital} ：文件被占用（{docx_file}），跳过"
                     )
-                    total_skipped_occupied += 1
                     total_errors += 1
                     continue
                 except Exception as e:
                     log_lines.append(
-                        f"   ❌ 患者 {patient} | {pure_date} ：读取文件失败（{docx_file}），错误：{e}"
+                        f"   ❌ 患者 {patient} | {pure_date} | 医院 {hospital} ：读取文件失败（{docx_file}），错误：{e}"
                     )
                     total_errors += 1
                     continue
 
+                # ========== 情况3：文件内容为空（仅有空格/换行） ==========
                 if not content or not content.strip():
-                    log_lines.append(
-                        f"   ⚠️ 患者 {patient} | {pure_date} ：文件内容为空，跳过"
+                    cursor.execute(
+                        "SELECT id, full_medical_text FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
+                        (patient, pure_date, hospital)
                     )
-                    total_skipped_empty += 1
-                    total_errors += 1
+                    row = cursor.fetchone()
+                    if row:
+                        existing_id, current_text = row
+                        if current_text and current_text.strip():
+                            # 以前有内容，现在变空了
+                            cursor.execute(
+                                "UPDATE visits SET docx_path = ?, full_medical_text = NULL, date_folder_path = ? WHERE id = ?",
+                                (docx_file, date_path, existing_id)
+                            )
+                            total_updated += 1
+                            log_lines.append(
+                                f"   ⚠️ 患者 {patient} | {pure_date} | 医院 {hospital} ：文件内容已被清空（仅空格），已更新为空记录"
+                            )
+                        else:
+                            # 以前就是空，只更新路径，不记日志
+                            cursor.execute(
+                                "UPDATE visits SET docx_path = ?, date_folder_path = ? WHERE id = ?",
+                                (docx_file, date_path, existing_id)
+                            )
+                            total_updated += 1
+                    else:
+                        cursor.execute(
+                            "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, ?, NULL, ?)",
+                            (patient, pure_date, hospital, docx_file, date_path)
+                        )
+                        total_inserted += 1
+                        log_lines.append(
+                            f"   ⚠️ 患者 {patient} | {pure_date} | 医院 {hospital} ：文件内容为空（仅空格），已创建空记录"
+                        )
                     continue
 
-                # 检查记录是否存在
+                # ========== 情况4：正常内容 ==========
                 cursor.execute(
-                    "SELECT id FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
+                    "SELECT id, full_medical_text FROM visits WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
                     (patient, pure_date, hospital)
                 )
-                existing = cursor.fetchone()
-                if existing:
-                    cursor.execute(
-                        "UPDATE visits SET docx_path = ?, full_medical_text = ?, date_folder_path = NULL WHERE id = ?",
-                        (docx_file, content, existing[0])
-                    )
-                    total_updated += 1
+                row = cursor.fetchone()
+                if row:
+                    existing_id, current_text = row
+                    # 如果内容没有变化，只更新路径，不记日志
+                    if current_text == content:
+                        cursor.execute(
+                            "UPDATE visits SET docx_path = ?, date_folder_path = ? WHERE id = ?",
+                            (docx_file, date_path, existing_id)
+                        )
+                        total_updated += 1
+                        # 内容未变，不记日志（静默更新路径）
+                    else:
+                        cursor.execute(
+                            "UPDATE visits SET docx_path = ?, full_medical_text = ?, date_folder_path = ? WHERE id = ?",
+                            (docx_file, content, date_path, existing_id)
+                        )
+                        total_updated += 1
+                        log_lines.append(
+                            f"   ✅ 更新记录：患者 {patient} | {pure_date} | 医院 {hospital}"
+                        )
                 else:
                     cursor.execute(
-                        "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text) VALUES (?, ?, ?, ?, ?)",
-                        (patient, pure_date, hospital, docx_file, content)
+                        "INSERT INTO visits (patient_name, visit_date, hospital, docx_path, full_medical_text, date_folder_path) VALUES (?, ?, ?, ?, ?, ?)",
+                        (patient, pure_date, hospital, docx_file, content, date_path)
                     )
                     total_inserted += 1
+                    log_lines.append(
+                        f"   ✅ 新增记录：患者 {patient} | {pure_date} | 医院 {hospital}"
+                    )
 
-                # 提取诊断
-                tcm_list, wm_list = extract_diagnosis(content, default_to_tcm=True)
+                # ========== 提取诊断（从 session_state 读取用户偏好，即时生效） ==========
+                import json
+                from aurum_core.text_utils import extract_diagnosis
+
+                diag_mode = get_user_setting('diagnosis_keyword_mode', '中医')
+                default_to_tcm = (diag_mode == "中医")
+                tcm_list, wm_list = extract_diagnosis(content, default_to_tcm=default_to_tcm)
                 if tcm_list:
                     cursor.execute(
                         "UPDATE visits SET diagnosis = ? WHERE patient_name = ? AND visit_date = ? AND hospital = ?",
@@ -989,32 +921,23 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
     conn.commit()
     conn.close()
 
-    # ---- 统计摘要 ----
-    log_lines.append("")
-    log_lines.append("📊 刷新统计：")
-    log_lines.append(f"   ✅ 更新记录数：{total_updated}")
-    log_lines.append(f"   ✅ 新增记录数：{total_inserted}")
-    if total_skipped_no_file > 0:
-        log_lines.append(f"   ⏭️ 跳过（无病历文件）：{total_skipped_no_file}")
-    if total_skipped_empty > 0:
-        log_lines.append(f"   ⏭️ 跳过（内容为空）：{total_skipped_empty}")
-    if total_skipped_occupied > 0:
-        log_lines.append(f"   ⏭️ 跳过（文件被占用）：{total_skipped_occupied}")
-    if total_skipped_date_parse > 0:
-        log_lines.append(f"   ⏭️ 跳过（日期格式无法解析）：{total_skipped_date_parse}")
-    if total_errors > 0:
-        log_lines.append(f"   ❌ 总错误数：{total_errors}")
+    # ---- 简洁总结 ----
+    # 先判断整体状态
+    if total_errors == 0:
+        log_lines.append("")
+        log_lines.append("✅ 所有记录已同步完成，索引已重建。")
     else:
-        log_lines.append("   🎉 无错误，全部成功！")
+        log_lines.append("")
+        log_lines.append(f"⚠️ 处理完成，但存在 {total_errors} 条错误。索引已重建。")
 
-    # ---- 提取个人信息 ----
+    # ---- 自动提取患者档案信息 ----
     try:
         from aurum_core.extract_patient_profiles import update_all_profiles
         update_all_profiles()
     except Exception as e:
         log_lines.append(f"⚠️ 自动提取个人信息失败：{e}")
 
-    # ---- 同步更新所有患者的档案文件 ----
+    # ---- 同步更新患者档案文件（_患者档案.txt） ----
     try:
         from aurum_core.file_processor import update_patient_archive_by_db
         conn2 = sqlite3.connect(db_path)
@@ -1032,5 +955,4 @@ def refresh_index_only(src_root: str, aggregate: bool = False) -> str:
     except Exception as e:
         log_lines.append(f"⚠️ 更新档案文件失败：{e}")
 
-    log_lines.append("✅ 刷新完成。")
     return "\n".join(log_lines)

@@ -8,6 +8,7 @@ import json
 from pypinyin import pinyin, Style
 from typing import List, Dict
 import pandas as pd
+from aurum_core.user_settings import get_user_setting
 
 def get_db_path(db_name="aurum_index.db") -> str:
     """返回项目根目录下的数据库完整路径"""
@@ -321,7 +322,6 @@ def check_existing_diagnosis(patient_name: str, visit_date: str, db_path="aurum_
 def get_all_visits_for_patient(patient_name: str, db_path="aurum_index.db") -> List[Dict]:
     """获取某患者所有就诊记录，按日期升序排列"""
     import sqlite3
-    from typing import List, Dict
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -343,25 +343,12 @@ def get_all_visits_for_patient(patient_name: str, db_path="aurum_index.db") -> L
             })
         return results
 
-def get_patient_folder(patient_name: str, db_path="aurum_index.db") -> str:
-    """获取患者档案所在的文件夹路径（例如：.../医院/患者/）"""
-    import os
-    import sqlite3
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT docx_path FROM visits WHERE patient_name = ? LIMIT 1", (patient_name,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            # docx_path 格式：医院/患者/日期/病历.docx，向上两级得到医院/患者/
-            return os.path.dirname(os.path.dirname(row[0]))
-        return None
-
 def get_all_patient_folders(patient_name: str, db_path="aurum_index.db") -> list:
     import os
     import sqlite3
+
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        # 同时查询 docx_path 和 date_folder_path
         cursor.execute(
             "SELECT docx_path, date_folder_path FROM visits WHERE patient_name = ?",
             (patient_name,)
@@ -369,21 +356,29 @@ def get_all_patient_folders(patient_name: str, db_path="aurum_index.db") -> list
         rows = cursor.fetchall()
         folders = []
         seen = set()
+        enable_hospital_layer = get_user_setting('enable_hospital_layer', True)
+
         for docx_path, date_folder_path in rows:
             folder = None
-            # 优先使用 date_folder_path
-            if date_folder_path:
-                # date_folder_path 存储的是日期文件夹路径，需要向上两层到达患者文件夹
-                # 但为了兼容性，我们检查它是否已经是患者文件夹层级
-                # 通常 date_folder_path 是 .../医院/患者/日期，我们需要 .../医院/患者
-                patient_folder = os.path.dirname(date_folder_path)
-                if os.path.exists(patient_folder):
+            if date_folder_path and os.path.exists(date_folder_path):
+                # date_folder_path 是日期文件夹路径
+                if enable_hospital_layer:
+                    # 有医院层：.../医院/患者/日期 → .../医院/患者
+                    patient_folder = os.path.dirname(date_folder_path)
                     folder = patient_folder
                 else:
-                    # 如果不存在（可能用户移动了根目录），回退到推断逻辑
-                    folder = date_folder_path
+                    # 无医院层：.../患者/日期 → .../患者
+                    patient_folder = os.path.dirname(date_folder_path)
+                    folder = patient_folder
             elif docx_path:
-                folder = os.path.dirname(os.path.dirname(docx_path))
+                # 从 docx_path 推断
+                if enable_hospital_layer:
+                    # 有医院层：.../医院/患者/日期/病历.docx → .../医院/患者
+                    folder = os.path.dirname(os.path.dirname(docx_path))
+                else:
+                    # 无医院层：.../患者/日期/病历.docx → .../患者
+                    folder = os.path.dirname(docx_path)
+
             if folder and folder not in seen:
                 folders.append(folder)
                 seen.add(folder)
@@ -500,3 +495,126 @@ def clean_orphan_tags(conn=None):
     if should_close:
         conn.commit()
         conn.close()
+
+def rename_patient(old_name: str, new_name: str, db_path: str = None) -> tuple:
+    """
+    重命名患者（仅更新数据库，不改文件系统）
+
+    参数:
+        old_name: 当前患者姓名
+        new_name: 新患者姓名
+        db_path: 数据库路径，默认使用 get_db_path()
+
+    返回:
+        (success: bool, message: str, folders_to_rename: list)
+    """
+    import sqlite3
+    from aurum_core.file_processor import clean_patient_name  # <--- 修正此处
+
+    if db_path is None:
+        db_path = get_db_path()
+
+    # ---- 1. 基本校验 ----
+    old_name = old_name.strip()
+    new_name = new_name.strip()
+
+    if not old_name:
+        return False, "旧患者姓名不能为空", []
+
+    if not new_name:
+        return False, "新患者姓名不能为空", []
+
+    new_name = clean_patient_name(new_name)
+
+    if old_name == new_name:
+        return False, "新姓名与旧姓名相同，无需修改", []
+
+    # ---- 2. 检查旧患者是否存在 ----
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT patient_name FROM patient_profiles WHERE patient_name = ?", (old_name,))
+    if not cursor.fetchone():
+        conn.close()
+        return False, f"患者「{old_name}」不存在", []
+
+    # ---- 3. 检查新姓名是否已存在（仅用于警告，不阻止） ----
+    cursor.execute("SELECT patient_name FROM patient_profiles WHERE patient_name = ?", (new_name,))
+    has_conflict = cursor.fetchone() is not None
+
+    # ---- 4. 获取需要手动重命名的文件夹列表 ----
+    # get_all_patient_folders 在 database.py 中已定义，直接使用
+    from aurum_core.database import get_all_patient_folders
+    folders_to_rename = get_all_patient_folders(old_name, db_path)
+
+    # ---- 5. 执行重命名事务 ----
+    try:
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("BEGIN TRANSACTION")
+
+        # 更新 patient_profiles
+        cursor.execute(
+            "UPDATE patient_profiles SET patient_name = ? WHERE patient_name = ?",
+            (new_name, old_name)
+        )
+        profiles_updated = cursor.rowcount
+
+        # 更新 visits
+        cursor.execute(
+            "UPDATE visits SET patient_name = ? WHERE patient_name = ?",
+            (new_name, old_name)
+        )
+        visits_updated = cursor.rowcount
+
+        # 更新 patient_group_links
+        cursor.execute(
+            "UPDATE patient_group_links SET patient_name = ? WHERE patient_name = ?",
+            (new_name, old_name)
+        )
+        links_updated = cursor.rowcount
+
+        cursor.execute("COMMIT")
+        cursor.execute("PRAGMA foreign_keys = ON")
+        conn.close()
+
+        # ---- 6. 更新档案文件 ----
+        archive_msg = ""
+        try:
+            from aurum_core.file_processor import update_patient_archive_by_db
+            update_patient_archive_by_db(new_name, aggregate=False)
+            archive_msg = "✅ 患者档案文件已同步更新。"
+        except Exception as e:
+            archive_msg = f"⚠️ 档案文件更新失败：{e}"
+
+        # ---- 7. 构建返回消息 ----
+        parts = []
+        if has_conflict:
+            parts.append(f"⚠️ 警告：数据库中已存在同名患者「{new_name}」，就诊记录已合并。")
+
+        parts.append(
+            f"✅ 患者已从「{old_name}」重命名为「{new_name}」。"
+            f"（更新了 {profiles_updated} 条档案记录、{visits_updated} 条就诊记录、{links_updated} 条标签关联）"
+        )
+        parts.append(archive_msg)
+
+        if folders_to_rename:
+            folder_list = "\n".join([f"   - {f}" for f in folders_to_rename])
+            parts.append(
+                f"\n⚠️ 请手动重命名以下文件夹中的患者文件夹（将「{old_name}」改为「{new_name}」）："
+                f"\n{folder_list}"
+                f"\n\n📌 重命名完成后，请执行「刷新数据库」同步文件路径。"
+            )
+
+        return True, "\n".join(parts), folders_to_rename
+
+    except Exception as e:
+        try:
+            cursor.execute("ROLLBACK")
+        except:
+            pass
+        try:
+            cursor.execute("PRAGMA foreign_keys = ON")
+        except:
+            pass
+        conn.close()
+        return False, f"❌ 重命名失败：{str(e)}", []
